@@ -12,4 +12,9 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  vite: {
+    // onnxruntime-web locates its .wasm via new URL(..., import.meta.url);
+    // dev pre-bundling would break that path.
+    optimizeDeps: { exclude: ["onnxruntime-web"] },
+  },
 });
