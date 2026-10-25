@@ -12,7 +12,8 @@ ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = 1;
 
 import { extractEmap, projectEmbedding } from './onnxEmap.js';
-import { DET_SIZE, rgbaToDetInput, decodeScrfd, squareCrop } from './scrfd.js';
+import { DET_SIZE, rgbaToDetInput, decodeScrfd } from './scrfd.js';
+import { alignMatrix, invertMatrix } from './faceAlign.js';
 
 const SWAPPER_URL =
   'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128.onnx';
