@@ -119,42 +119,64 @@ async function detectFace(source, srcW, srcH) {
   return faces[0] ?? null;
 }
 
-// Pega `face` (128x128) en `ctx` dentro de `rect`, con bordes suavizados
-// para que no se note el cuadrado.
-function pasteFeathered(ctx, face, rect) {
-  const w = Math.max(1, Math.round(rect.width));
-  const h = Math.max(1, Math.round(rect.height));
-  const tmp = document.createElement('canvas');
-  tmp.width = w;
-  tmp.height = h;
-  const t = tmp.getContext('2d');
-  t.drawImage(face, 0, 0, w, h);
-  const r = Math.min(w, h) / 2;
-  const grad = t.createRadialGradient(w / 2, h / 2, r * 0.6, w / 2, h / 2, r);
+// Recorta y alinea el rostro: dibuja `source` en `outCtx` (size x size)
+// aplicando la transformación de similitud que lleva los 5 keypoints a la
+// plantilla ArcFace. Ojos y boca quedan horizontales y sin deformación.
+function warpAligned(outCtx, source, matrix, size) {
+  outCtx.setTransform(1, 0, 0, 1, 0, 0);
+  outCtx.clearRect(0, 0, size, size);
+  outCtx.setTransform(...matrix);
+  outCtx.imageSmoothingQuality = 'high';
+  outCtx.drawImage(source, 0, 0);
+  outCtx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+// Pega `face` (alineado, 128x128) de vuelta en el frame con la transformación
+// inversa, usando una máscara con bordes suavizados para que no se note el corte.
+let pasteCanvas = null;
+function pasteAligned(ctx, face, matrix) {
+  const size = face.width;
+  if (!pasteCanvas) {
+    pasteCanvas = document.createElement('canvas');
+    pasteCanvas.width = size;
+    pasteCanvas.height = size;
+  }
+  const t = pasteCanvas.getContext('2d');
+  t.globalCompositeOperation = 'source-over';
+  t.clearRect(0, 0, size, size);
+  t.drawImage(face, 0, 0);
+  const r = size / 2;
+  const grad = t.createRadialGradient(r, r, r * 0.65, r, r, r);
   grad.addColorStop(0, 'rgba(0,0,0,1)');
   grad.addColorStop(1, 'rgba(0,0,0,0)');
   t.globalCompositeOperation = 'destination-in';
   t.fillStyle = grad;
-  t.fillRect(0, 0, w, h);
-  ctx.drawImage(tmp, rect.x, rect.y, rect.width, rect.height);
+  t.fillRect(0, 0, size, size);
+
+  ctx.save();
+  ctx.setTransform(...invertMatrix(matrix));
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(pasteCanvas, 0, 0);
+  ctx.restore();
 }
 
 // Extrae el embedding facial [1,512] con el reconocedor (ArcFace w600k_r50)
-// y lo proyecta con la matriz emap del swapper.
-async function getFaceEmbedding(faceImage) {
+// a partir del rostro alineado a 112x112, y lo proyecta con la matriz emap.
+async function getFaceEmbedding(source, kps) {
   const canvas = document.createElement('canvas');
   canvas.width = 112;
   canvas.height = 112;
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(faceImage, 0, 0, 112, 112);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  warpAligned(ctx, source, alignMatrix(kps, 112), 112);
 
   const imgData = ctx.getImageData(0, 0, 112, 112).data;
   const plane = 112 * 112;
   const floatData = new Float32Array(plane * 3);
   for (let i = 0; i < plane; i++) {
-    floatData[i] = (imgData[i * 4] - 127.5) / 128.0; // R
-    floatData[i + plane] = (imgData[i * 4 + 1] - 127.5) / 128.0; // G
-    floatData[i + 2 * plane] = (imgData[i * 4 + 2] - 127.5) / 128.0; // B
+    // Normalización de insightface para w600k_r50: (x - 127.5) / 127.5, RGB.
+    floatData[i] = (imgData[i * 4] - 127.5) / 127.5; // R
+    floatData[i + plane] = (imgData[i * 4 + 1] - 127.5) / 127.5; // G
+    floatData[i + 2 * plane] = (imgData[i * 4 + 2] - 127.5) / 127.5; // B
   }
 
   const tensor = new ort.Tensor('float32', floatData, [1, 3, 112, 112]);
@@ -228,15 +250,21 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
   // El detector se carga primero; los tres modelos quedan listos antes del bucle.
   const { swapperSession } = await ensureModels();
 
-  // 1. Preparar el rostro fuente: embedding [1,512] del reconocedor.
+  // 1. Preparar el rostro fuente: detectar la cara en la foto, alinearla con
+  // sus 5 keypoints y sacar el embedding [1,512] solo de ese rostro.
   // drawImage no acepta un File, así que lo convertimos a bitmap primero.
   const sourceBitmap = await createImageBitmap(faceImage);
-  const sourceEmbedding = await getFaceEmbedding(sourceBitmap);
-  sourceBitmap.close();
-
-  // Nota: el modelo inswapper espera un rostro alineado.
-  // Por ahora usamos la imagen tal cual; si el resultado no es bueno,
-  // más adelante añadimos alineación con el detector.
+  let sourceEmbedding;
+  try {
+    const sourceFace = await detectFace(sourceBitmap, sourceBitmap.width, sourceBitmap.height);
+    if (!sourceFace || sourceFace.kps.length !== 5) {
+      throw new Error('No se encontró un rostro en la foto de origen. Prueba con una foto más clara y de frente.');
+    }
+    console.log('Rostro detectado en la foto de origen:', sourceFace);
+    sourceEmbedding = await getFaceEmbedding(sourceBitmap, sourceFace.kps);
+  } finally {
+    sourceBitmap.close();
+  }
 
   // 2. Decodificar el video: <video> + canvas (más compatible que WebCodecs,
   // que además necesitaría un demuxer para leer el archivo).
@@ -284,11 +312,11 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
 
       // Detectar el rostro con SCRFD. Si no hay rostro, el frame queda igual.
       const face = await detectFace(canvas, canvas.width, canvas.height);
-      if (face) {
+      if (face && face.kps.length === 5) {
         if (i === 0) console.log('Rostro detectado en el frame 0:', face);
-        // Recorte cuadrado alrededor de la caja del detector (inswapper usa 128x128).
-        const crop = squareCrop(face, canvas.width, canvas.height);
-        faceCtx.drawImage(canvas, crop.x, crop.y, crop.width, crop.height, 0, 0, 128, 128);
+        // Alinear el rostro a 128x128 con los 5 keypoints (plantilla ArcFace).
+        const matrix = alignMatrix(face.kps, 128);
+        warpAligned(faceCtx, canvas, matrix, 128);
 
         // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
         const targetTensor = canvasToTensor(faceCanvas, 128);
@@ -307,10 +335,10 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
           );
         }
 
-        // Tomar la salida y pegarla en las coordenadas exactas del recorte.
+        // Tomar la salida y devolverla al frame con la transformación inversa.
         const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
         const outCanvas = tensorToCanvas(output[outKey].data, 128);
-        pasteFeathered(ctx, outCanvas, crop);
+        pasteAligned(ctx, outCanvas, matrix);
       } else {
         console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
       }
