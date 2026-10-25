@@ -225,6 +225,7 @@ function pickRecorderMimeType() {
  * @returns {Promise<Blob>} the processed video
  */
 export async function swapFaces(faceImage, videoFile, onProgress) {
+  // El detector se carga primero; los tres modelos quedan listos antes del bucle.
   const { swapperSession } = await ensureModels();
 
   // 1. Preparar el rostro fuente: embedding [1,512] del reconocedor.
@@ -281,38 +282,38 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
 
       ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
 
-      // Detectar rostro (simplificado: usamos el frame completo reducido)
-      // En una versión completa aquí va la detección real con detectorSession.
-      // Por ahora, recortamos el centro del frame como "rostro" para probar el pipeline.
-      const cropX = canvas.width * 0.3;
-      const cropY = canvas.height * 0.2;
-      const cropW = canvas.width * 0.4;
-      const cropH = canvas.height * 0.4;
-      faceCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, 128, 128);
+      // Detectar el rostro con SCRFD. Si no hay rostro, el frame queda igual.
+      const face = await detectFace(canvas, canvas.width, canvas.height);
+      if (face) {
+        if (i === 0) console.log('Rostro detectado en el frame 0:', face);
+        // Recorte cuadrado alrededor de la caja del detector (inswapper usa 128x128).
+        const crop = squareCrop(face, canvas.width, canvas.height);
+        faceCtx.drawImage(canvas, crop.x, crop.y, crop.width, crop.height, 0, 0, 128, 128);
 
-      // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
-      const targetTensor = canvasToTensor(faceCanvas, 128);
+        // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
+        const targetTensor = canvasToTensor(faceCanvas, 128);
 
-      let output;
-      try {
-        output = await swapperSession.run({
-          target: targetTensor,
-          source: sourceEmbedding, // [1, 512]
-        });
-      } catch (e) {
-        throw new Error(
-          'El swapper rechazó las entradas. inswapper_128 espera "source" como un ' +
-            'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
-            `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
-        );
+        let output;
+        try {
+          output = await swapperSession.run({
+            target: targetTensor,
+            source: sourceEmbedding, // [1, 512]
+          });
+        } catch (e) {
+          throw new Error(
+            'El swapper rechazó las entradas. inswapper_128 espera "source" como un ' +
+              'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
+              `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
+          );
+        }
+
+        // Tomar la salida y pegarla en las coordenadas exactas del recorte.
+        const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
+        const outCanvas = tensorToCanvas(output[outKey].data, 128);
+        pasteFeathered(ctx, outCanvas, crop);
+      } else {
+        console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
       }
-
-      // Tomar la salida y dibujarla de vuelta
-      const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
-      const outCanvas = tensorToCanvas(output[outKey].data, 128);
-
-      // Pegar el rostro procesado de vuelta en el frame
-      ctx.drawImage(outCanvas, cropX, cropY, cropW, cropH);
 
       frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
 
