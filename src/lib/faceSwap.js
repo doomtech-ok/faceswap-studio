@@ -178,6 +178,7 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
       const targetTensor = canvasToTensor(faceCanvas, 128);
 
       let output;
+      console.log('Entradas que espera el modelo:', swapperSession.inputNames);
       try {
         output = await swapperSession.run({
           target: targetTensor,
