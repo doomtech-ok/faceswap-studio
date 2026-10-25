@@ -188,15 +188,19 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
     canvas.height = videoEl.videoHeight;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-    const frames = [];
     const fps = 10; // procesamos 10 fps para no saturar la RX 580
-    const totalFrames = Math.max(1, Math.floor(duration * fps));
 
     const faceCanvas = document.createElement('canvas');
     faceCanvas.width = 128;
     faceCanvas.height = 128;
     const faceCtx = faceCanvas.getContext('2d', { willReadFrequently: true });
 
+    // Mueve el console.log de las entradas AQUÍ, antes del bucle
+    console.log('Entradas que espera el modelo:', swapperSession.inputNames);
+
+    const frames = [];
+    // Solo 5 frames para probar rápido (o menos si el video es muy corto)
+    const totalFrames = Math.min(5, Math.max(1, Math.floor(duration * fps)));
 
     for (let i = 0; i < totalFrames; i++) {
       const seeked = new Promise((r) => (videoEl.onseeked = r));
@@ -218,7 +222,6 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
       const targetTensor = canvasToTensor(faceCanvas, 128);
 
       let output;
-      console.log('Entradas que espera el modelo:', swapperSession.inputNames);
       try {
         output = await swapperSession.run({
           target: targetTensor,
@@ -240,6 +243,9 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
       ctx.drawImage(outCanvas, cropX, cropY, cropW, cropH);
 
       frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+
+      // Al final de cada iteración, cede el hilo
+      await new Promise((r) => setTimeout(r, 100));
 
       if (onProgress) onProgress((i + 1) / totalFrames);
     }
