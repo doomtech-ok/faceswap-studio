@@ -37,47 +37,55 @@ function useObjectUrl(file: File | null) {
   return url;
 }
 
-type Status = "idle" | "processing" | "done";
+type Status = "idle" | "processing" | "done" | "error";
 
 function Index() {
   const [face, setFace] = useState<File | null>(null);
   const [video, setVideo] = useState<File | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [result, setResult] = useState<Blob | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Each run gets an id so a stale run can't overwrite state after a reset.
+  const runId = useRef(0);
 
   const faceUrl = useObjectUrl(face);
-  const videoUrl = useObjectUrl(video);
-
-  useEffect(() => () => {
-    if (timer.current) clearInterval(timer.current);
-  }, []);
+  const resultUrl = useObjectUrl(result as File | null);
 
   const reset = () => {
-    if (timer.current) clearInterval(timer.current);
+    runId.current += 1;
     setStatus("idle");
     setProgress(0);
+    setResult(null);
+    setError(null);
   };
 
-  // Placeholder run: no processing engine is connected yet, so this only
-  // animates progress and then shows the target clip in the result player.
-  const start = () => {
+  const start = async () => {
     if (!face || !video) return;
+    const id = ++runId.current;
     setStatus("processing");
     setProgress(0);
-    timer.current = setInterval(() => {
-      setProgress((p) => {
-        const next = Math.min(100, p + 4);
-        if (next >= 100 && timer.current) {
-          clearInterval(timer.current);
-          setStatus("done");
-        }
-        return next;
+    setResult(null);
+    setError(null);
+    try {
+      // Loaded on demand: the AI runtime only works in the browser.
+      const { swapFaces } = await import("@/lib/faceSwap.js");
+      const blob = await swapFaces(face, video, (fraction) => {
+        if (runId.current === id) setProgress(Math.round(fraction * 100));
       });
-    }, 80);
+      if (runId.current !== id) return;
+      setResult(blob);
+      setStatus("done");
+    } catch (e) {
+      if (runId.current !== id) return;
+      console.error("Face swap failed:", e);
+      setError(e instanceof Error ? e.message : String(e));
+      setStatus("error");
+    }
   };
 
   const ready = Boolean(face && video) && status !== "processing";
+  const resultExt = result?.type.includes("mp4") ? "mp4" : "webm";
 
   return (
     <main className="min-h-screen bg-grid">
