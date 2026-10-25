@@ -150,13 +150,10 @@ function pickRecorderMimeType() {
 export async function swapFaces(faceImage, videoFile, onProgress) {
   const { swapperSession } = await ensureModels();
 
-  // 1. Preparar el rostro fuente (imagen subida por el usuario)
+  // 1. Preparar el rostro fuente: embedding [1,512] del reconocedor.
+  // drawImage no acepta un File, así que lo convertimos a bitmap primero.
   const sourceBitmap = await createImageBitmap(faceImage);
-  const sourceCanvas = document.createElement('canvas');
-  sourceCanvas.width = 128;
-  sourceCanvas.height = 128;
-  const sourceCtx = sourceCanvas.getContext('2d');
-  sourceCtx.drawImage(sourceBitmap, 0, 0, 128, 128);
+  const sourceEmbedding = await getFaceEmbedding(sourceBitmap);
   sourceBitmap.close();
 
   // Nota: el modelo inswapper espera un rostro alineado.
