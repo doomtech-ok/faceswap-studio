@@ -12,10 +12,15 @@ ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = 1;
 
 import { extractEmap, projectEmbedding } from './onnxEmap.js';
+import { DET_SIZE, rgbaToDetInput, decodeScrfd, squareCrop } from './scrfd.js';
 
 const SWAPPER_URL =
   'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128.onnx';
+// SCRFD 10G con keypoints (det_10g de InsightFace buffalo_l), ~17 MB.
+const DETECTOR_URL = 'https://huggingface.co/maze/faceX/resolve/main/det_10g.onnx';
+const RECOGNIZER_URL = 'https://huggingface.co/maze/faceX/resolve/main/w600k_r50.onnx';
 
+let detectorSession = null;
 let swapperSession = null;
 let recognizerSession = null;
 let emap = null; // Float32Array 512x512 (fila mayor)
@@ -39,20 +44,26 @@ export async function runModel(session, feeds) {
   return await session.run(feeds);
 }
 
-// Inicializa solo el swapper. WebGPU solo permite crear una sesión a la vez,
-// así que el detector queda fuera por ahora y bloqueamos cargas concurrentes.
+// Carga los tres modelos de forma secuencial (WebGPU solo permite crear una
+// sesión a la vez) y bloquea cargas concurrentes.
 let isLoading = false;
 let loadingPromise = null;
 
 async function ensureModels() {
-  if (swapperSession && recognizerSession) return { swapperSession, recognizerSession };
+  if (detectorSession && swapperSession && recognizerSession) {
+    return { detectorSession, swapperSession, recognizerSession };
+  }
   // Si ya hay una carga en curso, esperamos esa en lugar de crear otra sesión.
   if (isLoading && loadingPromise) return loadingPromise;
 
   isLoading = true;
   loadingPromise = (async () => {
     try {
-      // Carga secuencial (una sesión a la vez) para no bloquear WebGPU.
+      if (!detectorSession) {
+        console.log('Cargando detector facial (SCRFD)...');
+        detectorSession = await loadModel(DETECTOR_URL);
+        console.log('✅ Detector listo');
+      }
       if (!swapperSession) {
         console.log('Descargando swapper (puede tardar por el tamaño)...');
         // Descargamos los bytes nosotros mismos para leer la matriz emap del
@@ -69,18 +80,63 @@ async function ensureModels() {
       }
       if (!recognizerSession) {
         console.log('Cargando reconocedor facial...');
-        recognizerSession = await loadModel(
-          'https://huggingface.co/maze/faceX/resolve/main/w600k_r50.onnx'
-        );
+        recognizerSession = await loadModel(RECOGNIZER_URL);
         console.log('✅ Reconocedor listo');
       }
-      return { swapperSession, recognizerSession };
+      return { detectorSession, swapperSession, recognizerSession };
     } finally {
       isLoading = false;
       loadingPromise = null;
     }
   })();
   return loadingPromise;
+}
+
+// --- Detección de rostros (SCRFD) ---
+
+let detCanvas = null;
+
+// Devuelve el rostro con mayor puntuación en `source` (canvas, video o bitmap)
+// como { x, y, width, height, score, kps } en píxeles de `source`, o null.
+async function detectFace(source, srcW, srcH) {
+  if (!detCanvas) {
+    detCanvas = document.createElement('canvas');
+    detCanvas.width = DET_SIZE;
+    detCanvas.height = DET_SIZE;
+  }
+  const ctx = detCanvas.getContext('2d', { willReadFrequently: true });
+  // Letterbox: escalar manteniendo proporción y pegar arriba a la izquierda.
+  const scale = Math.min(DET_SIZE / srcW, DET_SIZE / srcH);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, DET_SIZE, DET_SIZE);
+  ctx.drawImage(source, 0, 0, srcW * scale, srcH * scale);
+
+  const rgba = ctx.getImageData(0, 0, DET_SIZE, DET_SIZE).data;
+  const tensor = new ort.Tensor('float32', rgbaToDetInput(rgba), [1, 3, DET_SIZE, DET_SIZE]);
+  const out = await detectorSession.run({ [detectorSession.inputNames[0]]: tensor });
+  const outputs = detectorSession.outputNames.map((n) => out[n]);
+  const faces = decodeScrfd(outputs, scale);
+  return faces[0] ?? null;
+}
+
+// Pega `face` (128x128) en `ctx` dentro de `rect`, con bordes suavizados
+// para que no se note el cuadrado.
+function pasteFeathered(ctx, face, rect) {
+  const w = Math.max(1, Math.round(rect.width));
+  const h = Math.max(1, Math.round(rect.height));
+  const tmp = document.createElement('canvas');
+  tmp.width = w;
+  tmp.height = h;
+  const t = tmp.getContext('2d');
+  t.drawImage(face, 0, 0, w, h);
+  const r = Math.min(w, h) / 2;
+  const grad = t.createRadialGradient(w / 2, h / 2, r * 0.6, w / 2, h / 2, r);
+  grad.addColorStop(0, 'rgba(0,0,0,1)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  t.globalCompositeOperation = 'destination-in';
+  t.fillStyle = grad;
+  t.fillRect(0, 0, w, h);
+  ctx.drawImage(tmp, rect.x, rect.y, rect.width, rect.height);
 }
 
 // Extrae el embedding facial [1,512] con el reconocedor (ArcFace w600k_r50)
