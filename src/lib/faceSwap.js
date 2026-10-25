@@ -12,6 +12,7 @@ ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = 1;
 
 let swapperSession = null;
+let recognizerSession = null;
 
 export { ort };
 
@@ -35,25 +36,59 @@ let isLoading = false;
 let loadingPromise = null;
 
 async function ensureModels() {
-  if (swapperSession) return { swapperSession };
+  if (swapperSession && recognizerSession) return { swapperSession, recognizerSession };
   // Si ya hay una carga en curso, esperamos esa en lugar de crear otra sesión.
   if (isLoading && loadingPromise) return loadingPromise;
 
   isLoading = true;
   loadingPromise = (async () => {
     try {
-      console.log('Cargando swapper (puede tardar por el tamaño)...');
-      swapperSession = await loadModel(
-        'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128_fp16.onnx'
-      );
-      console.log('✅ Swapper listo');
-      return { swapperSession };
+      // Carga secuencial (una sesión a la vez) para no bloquear WebGPU.
+      if (!swapperSession) {
+        console.log('Cargando swapper (puede tardar por el tamaño)...');
+        swapperSession = await loadModel(
+          'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128_fp16.onnx'
+        );
+        console.log('✅ Swapper listo');
+      }
+      if (!recognizerSession) {
+        console.log('Cargando reconocedor facial...');
+        recognizerSession = await loadModel(
+          'https://huggingface.co/maze/faceX/resolve/main/w600k_r50.onnx'
+        );
+        console.log('✅ Reconocedor listo');
+      }
+      return { swapperSession, recognizerSession };
     } finally {
       isLoading = false;
       loadingPromise = null;
     }
   })();
   return loadingPromise;
+}
+
+// Extrae el embedding facial [1,512] con el reconocedor (ArcFace w600k_r50).
+async function getFaceEmbedding(faceImage) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 112;
+  canvas.height = 112;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(faceImage, 0, 0, 112, 112);
+
+  const imgData = ctx.getImageData(0, 0, 112, 112).data;
+  const plane = 112 * 112;
+  const floatData = new Float32Array(plane * 3);
+  for (let i = 0; i < plane; i++) {
+    floatData[i] = (imgData[i * 4] - 127.5) / 128.0; // R
+    floatData[i + plane] = (imgData[i * 4 + 1] - 127.5) / 128.0; // G
+    floatData[i + 2 * plane] = (imgData[i * 4 + 2] - 127.5) / 128.0; // B
+  }
+
+  const tensor = new ort.Tensor('float32', floatData, [1, 3, 112, 112]);
+  // Usamos el nombre real de la entrada del modelo (suele ser 'input.1' o 'input').
+  const inputName = recognizerSession.inputNames[0] ?? 'input';
+  const output = await recognizerSession.run({ [inputName]: tensor });
+  return output[recognizerSession.outputNames[0] ?? Object.keys(output)[0]];
 }
 
 // --- Utilidades de imagen ---
@@ -115,13 +150,10 @@ function pickRecorderMimeType() {
 export async function swapFaces(faceImage, videoFile, onProgress) {
   const { swapperSession } = await ensureModels();
 
-  // 1. Preparar el rostro fuente (imagen subida por el usuario)
+  // 1. Preparar el rostro fuente: embedding [1,512] del reconocedor.
+  // drawImage no acepta un File, así que lo convertimos a bitmap primero.
   const sourceBitmap = await createImageBitmap(faceImage);
-  const sourceCanvas = document.createElement('canvas');
-  sourceCanvas.width = 128;
-  sourceCanvas.height = 128;
-  const sourceCtx = sourceCanvas.getContext('2d');
-  sourceCtx.drawImage(sourceBitmap, 0, 0, 128, 128);
+  const sourceEmbedding = await getFaceEmbedding(sourceBitmap);
   sourceBitmap.close();
 
   // Nota: el modelo inswapper espera un rostro alineado.
@@ -160,7 +192,6 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
     faceCanvas.height = 128;
     const faceCtx = faceCanvas.getContext('2d', { willReadFrequently: true });
 
-    const sourceTensor = canvasToTensor(sourceCanvas, 128);
 
     for (let i = 0; i < totalFrames; i++) {
       const seeked = new Promise((r) => (videoEl.onseeked = r));
@@ -186,7 +217,7 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
       try {
         output = await swapperSession.run({
           target: targetTensor,
-          source: sourceTensor,
+          source: sourceEmbedding, // [1, 512]
         });
       } catch (e) {
         throw new Error(
