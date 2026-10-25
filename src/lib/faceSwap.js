@@ -11,8 +11,14 @@ import * as ort from 'onnxruntime-web/webgpu';
 ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = 1;
 
+import { extractEmap, projectEmbedding } from './onnxEmap.js';
+
+const SWAPPER_URL =
+  'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128.onnx';
+
 let swapperSession = null;
 let recognizerSession = null;
+let emap = null; // Float32Array 512x512 (fila mayor)
 
 export { ort };
 
@@ -48,12 +54,17 @@ async function ensureModels() {
     try {
       // Carga secuencial (una sesión a la vez) para no bloquear WebGPU.
       if (!swapperSession) {
-        console.log('Cargando swapper en WASM (puede tardar por el tamaño)...');
+        console.log('Descargando swapper (puede tardar por el tamaño)...');
+        // Descargamos los bytes nosotros mismos para leer la matriz emap del
+        // archivo (ORT Web no expone los initializers de la sesión).
+        const res = await fetch(SWAPPER_URL);
+        if (!res.ok) throw new Error(`No se pudo descargar el swapper (${res.status}).`);
+        let bytes = new Uint8Array(await res.arrayBuffer());
+        emap = extractEmap(bytes);
+        console.log('✅ Matriz emap extraída [512,512]');
         // Precisión completa y solo WASM: la RX 580 no soporta shader-f16 en WebGPU.
-        swapperSession = await loadModel(
-          'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128.onnx',
-          ['wasm']
-        );
+        swapperSession = await loadModel(bytes, ['wasm']);
+        bytes = null; // liberar memoria
         console.log('✅ Swapper listo');
       }
       if (!recognizerSession) {
@@ -72,7 +83,8 @@ async function ensureModels() {
   return loadingPromise;
 }
 
-// Extrae el embedding facial [1,512] con el reconocedor (ArcFace w600k_r50).
+// Extrae el embedding facial [1,512] con el reconocedor (ArcFace w600k_r50)
+// y lo proyecta con la matriz emap del swapper.
 async function getFaceEmbedding(faceImage) {
   const canvas = document.createElement('canvas');
   canvas.width = 112;
@@ -93,7 +105,11 @@ async function getFaceEmbedding(faceImage) {
   // Usamos el nombre real de la entrada del modelo (suele ser 'input.1' o 'input').
   const inputName = recognizerSession.inputNames[0] ?? 'input';
   const output = await recognizerSession.run({ [inputName]: tensor });
-  return output[recognizerSession.outputNames[0] ?? Object.keys(output)[0]];
+  const raw = output[recognizerSession.outputNames[0] ?? Object.keys(output)[0]];
+
+  // result[j] = sum_i(embedding[i] * emap[i][j]), con normalización L2 como insightface.
+  const projected = projectEmbedding(raw.data, emap);
+  return new ort.Tensor('float32', projected, [1, 512]);
 }
 
 // --- Utilidades de imagen ---
