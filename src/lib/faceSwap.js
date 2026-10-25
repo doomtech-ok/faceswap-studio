@@ -12,10 +12,15 @@ ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = 1;
 
 import { extractEmap, projectEmbedding } from './onnxEmap.js';
+import { DET_SIZE, rgbaToDetInput, decodeScrfd, squareCrop } from './scrfd.js';
 
 const SWAPPER_URL =
   'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128.onnx';
+// SCRFD 10G con keypoints (det_10g de InsightFace buffalo_l), ~17 MB.
+const DETECTOR_URL = 'https://huggingface.co/maze/faceX/resolve/main/det_10g.onnx';
+const RECOGNIZER_URL = 'https://huggingface.co/maze/faceX/resolve/main/w600k_r50.onnx';
 
+let detectorSession = null;
 let swapperSession = null;
 let recognizerSession = null;
 let emap = null; // Float32Array 512x512 (fila mayor)
@@ -39,20 +44,26 @@ export async function runModel(session, feeds) {
   return await session.run(feeds);
 }
 
-// Inicializa solo el swapper. WebGPU solo permite crear una sesión a la vez,
-// así que el detector queda fuera por ahora y bloqueamos cargas concurrentes.
+// Carga los tres modelos de forma secuencial (WebGPU solo permite crear una
+// sesión a la vez) y bloquea cargas concurrentes.
 let isLoading = false;
 let loadingPromise = null;
 
 async function ensureModels() {
-  if (swapperSession && recognizerSession) return { swapperSession, recognizerSession };
+  if (detectorSession && swapperSession && recognizerSession) {
+    return { detectorSession, swapperSession, recognizerSession };
+  }
   // Si ya hay una carga en curso, esperamos esa en lugar de crear otra sesión.
   if (isLoading && loadingPromise) return loadingPromise;
 
   isLoading = true;
   loadingPromise = (async () => {
     try {
-      // Carga secuencial (una sesión a la vez) para no bloquear WebGPU.
+      if (!detectorSession) {
+        console.log('Cargando detector facial (SCRFD)...');
+        detectorSession = await loadModel(DETECTOR_URL);
+        console.log('✅ Detector listo');
+      }
       if (!swapperSession) {
         console.log('Descargando swapper (puede tardar por el tamaño)...');
         // Descargamos los bytes nosotros mismos para leer la matriz emap del
@@ -69,18 +80,63 @@ async function ensureModels() {
       }
       if (!recognizerSession) {
         console.log('Cargando reconocedor facial...');
-        recognizerSession = await loadModel(
-          'https://huggingface.co/maze/faceX/resolve/main/w600k_r50.onnx'
-        );
+        recognizerSession = await loadModel(RECOGNIZER_URL);
         console.log('✅ Reconocedor listo');
       }
-      return { swapperSession, recognizerSession };
+      return { detectorSession, swapperSession, recognizerSession };
     } finally {
       isLoading = false;
       loadingPromise = null;
     }
   })();
   return loadingPromise;
+}
+
+// --- Detección de rostros (SCRFD) ---
+
+let detCanvas = null;
+
+// Devuelve el rostro con mayor puntuación en `source` (canvas, video o bitmap)
+// como { x, y, width, height, score, kps } en píxeles de `source`, o null.
+async function detectFace(source, srcW, srcH) {
+  if (!detCanvas) {
+    detCanvas = document.createElement('canvas');
+    detCanvas.width = DET_SIZE;
+    detCanvas.height = DET_SIZE;
+  }
+  const ctx = detCanvas.getContext('2d', { willReadFrequently: true });
+  // Letterbox: escalar manteniendo proporción y pegar arriba a la izquierda.
+  const scale = Math.min(DET_SIZE / srcW, DET_SIZE / srcH);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, DET_SIZE, DET_SIZE);
+  ctx.drawImage(source, 0, 0, srcW * scale, srcH * scale);
+
+  const rgba = ctx.getImageData(0, 0, DET_SIZE, DET_SIZE).data;
+  const tensor = new ort.Tensor('float32', rgbaToDetInput(rgba), [1, 3, DET_SIZE, DET_SIZE]);
+  const out = await detectorSession.run({ [detectorSession.inputNames[0]]: tensor });
+  const outputs = detectorSession.outputNames.map((n) => out[n]);
+  const faces = decodeScrfd(outputs, scale);
+  return faces[0] ?? null;
+}
+
+// Pega `face` (128x128) en `ctx` dentro de `rect`, con bordes suavizados
+// para que no se note el cuadrado.
+function pasteFeathered(ctx, face, rect) {
+  const w = Math.max(1, Math.round(rect.width));
+  const h = Math.max(1, Math.round(rect.height));
+  const tmp = document.createElement('canvas');
+  tmp.width = w;
+  tmp.height = h;
+  const t = tmp.getContext('2d');
+  t.drawImage(face, 0, 0, w, h);
+  const r = Math.min(w, h) / 2;
+  const grad = t.createRadialGradient(w / 2, h / 2, r * 0.6, w / 2, h / 2, r);
+  grad.addColorStop(0, 'rgba(0,0,0,1)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  t.globalCompositeOperation = 'destination-in';
+  t.fillStyle = grad;
+  t.fillRect(0, 0, w, h);
+  ctx.drawImage(tmp, rect.x, rect.y, rect.width, rect.height);
 }
 
 // Extrae el embedding facial [1,512] con el reconocedor (ArcFace w600k_r50)
@@ -169,6 +225,7 @@ function pickRecorderMimeType() {
  * @returns {Promise<Blob>} the processed video
  */
 export async function swapFaces(faceImage, videoFile, onProgress) {
+  // El detector se carga primero; los tres modelos quedan listos antes del bucle.
   const { swapperSession } = await ensureModels();
 
   // 1. Preparar el rostro fuente: embedding [1,512] del reconocedor.
@@ -225,38 +282,38 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
 
       ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
 
-      // Detectar rostro (simplificado: usamos el frame completo reducido)
-      // En una versión completa aquí va la detección real con detectorSession.
-      // Por ahora, recortamos el centro del frame como "rostro" para probar el pipeline.
-      const cropX = canvas.width * 0.3;
-      const cropY = canvas.height * 0.2;
-      const cropW = canvas.width * 0.4;
-      const cropH = canvas.height * 0.4;
-      faceCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, 128, 128);
+      // Detectar el rostro con SCRFD. Si no hay rostro, el frame queda igual.
+      const face = await detectFace(canvas, canvas.width, canvas.height);
+      if (face) {
+        if (i === 0) console.log('Rostro detectado en el frame 0:', face);
+        // Recorte cuadrado alrededor de la caja del detector (inswapper usa 128x128).
+        const crop = squareCrop(face, canvas.width, canvas.height);
+        faceCtx.drawImage(canvas, crop.x, crop.y, crop.width, crop.height, 0, 0, 128, 128);
 
-      // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
-      const targetTensor = canvasToTensor(faceCanvas, 128);
+        // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
+        const targetTensor = canvasToTensor(faceCanvas, 128);
 
-      let output;
-      try {
-        output = await swapperSession.run({
-          target: targetTensor,
-          source: sourceEmbedding, // [1, 512]
-        });
-      } catch (e) {
-        throw new Error(
-          'El swapper rechazó las entradas. inswapper_128 espera "source" como un ' +
-            'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
-            `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
-        );
+        let output;
+        try {
+          output = await swapperSession.run({
+            target: targetTensor,
+            source: sourceEmbedding, // [1, 512]
+          });
+        } catch (e) {
+          throw new Error(
+            'El swapper rechazó las entradas. inswapper_128 espera "source" como un ' +
+              'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
+              `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
+          );
+        }
+
+        // Tomar la salida y pegarla en las coordenadas exactas del recorte.
+        const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
+        const outCanvas = tensorToCanvas(output[outKey].data, 128);
+        pasteFeathered(ctx, outCanvas, crop);
+      } else {
+        console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
       }
-
-      // Tomar la salida y dibujarla de vuelta
-      const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
-      const outCanvas = tensorToCanvas(output[outKey].data, 128);
-
-      // Pegar el rostro procesado de vuelta en el frame
-      ctx.drawImage(outCanvas, cropX, cropY, cropW, cropH);
 
       frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
 

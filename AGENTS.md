@@ -16,3 +16,4 @@
 - The app is dark-only (tokens defined in `:root`, no `.dark` toggle); why: the requested design is a dark theme.
 - Face-swap AI logic lives in `src/lib/faceSwap.js`, imports `onnxruntime-web/webgpu` (not the default entry), and is loaded only via dynamic `import()` on the client; why: the user requested WebGPU, and ORT uses browser APIs that break SSR.
 - `onnxruntime-web` is excluded from Vite `optimizeDeps`; why: pre-bundling breaks its `new URL(..., import.meta.url)` wasm lookup in dev.
+- SCRFD detector decoding lives in `src/lib/scrfd.js` as pure, DOM-free functions that classify outputs by shape, not name; why: lets it be tested in Node against the real model and survives exports with different output names.
