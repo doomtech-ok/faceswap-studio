@@ -192,7 +192,6 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
     faceCanvas.height = 128;
     const faceCtx = faceCanvas.getContext('2d', { willReadFrequently: true });
 
-    const sourceTensor = canvasToTensor(sourceCanvas, 128);
 
     for (let i = 0; i < totalFrames; i++) {
       const seeked = new Promise((r) => (videoEl.onseeked = r));
@@ -218,7 +217,7 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
       try {
         output = await swapperSession.run({
           target: targetTensor,
-          source: sourceTensor,
+          source: sourceEmbedding, // [1, 512]
         });
       } catch (e) {
         throw new Error(
