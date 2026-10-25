@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
-import { Film, ScanFace, Sparkles, Download, RotateCcw } from "lucide-react";
+import { AlertTriangle, Film, ScanFace, Sparkles, Download, RotateCcw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -23,7 +23,7 @@ export const Route = createFileRoute("/")({
 const MAX_IMAGE_MB = 10;
 const MAX_VIDEO_MB = 100;
 
-function useObjectUrl(file: File | null) {
+function useObjectUrl(file: Blob | null) {
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
     if (!file) {
@@ -50,7 +50,8 @@ function Index() {
   const runId = useRef(0);
 
   const faceUrl = useObjectUrl(face);
-  const resultUrl = useObjectUrl(result as File | null);
+  const videoUrl = useObjectUrl(video);
+  const resultUrl = useObjectUrl(result);
 
   const reset = () => {
     runId.current += 1;
@@ -169,17 +170,26 @@ function Index() {
                 {status === "idle" && "Waiting"}
                 {status === "processing" && `${progress}%`}
                 {status === "done" && "Ready"}
+                {status === "error" && "Failed"}
               </span>
             </header>
 
             <div className="relative flex aspect-video items-center justify-center overflow-hidden rounded-2xl border bg-surface">
-              {status === "done" && videoUrl ? (
-                <video key={videoUrl} src={videoUrl} controls autoPlay playsInline className="h-full w-full bg-background object-contain" />
+              {status === "done" && resultUrl ? (
+                <video key={resultUrl} src={resultUrl} controls autoPlay playsInline className="h-full w-full bg-background object-contain" />
               ) : status === "processing" ? (
                 <div className="flex w-full max-w-xs flex-col items-center gap-4 px-6 text-center">
                   <ScanFace className="size-8 animate-pulse text-primary" />
                   <Progress value={progress} className="h-1.5 bg-muted [&>div]:bg-primary" />
-                  <p className="font-mono text-xs text-muted-foreground">Processing frames…</p>
+                  <p className="font-mono text-xs text-muted-foreground">
+                    {progress === 0 ? "Loading models… this can take a while the first time" : "Processing frames…"}
+                  </p>
+                </div>
+              ) : status === "error" ? (
+                <div className="flex max-w-md flex-col items-center gap-3 px-6 text-center">
+                  <AlertTriangle className="size-8 text-destructive" />
+                  <p className="text-sm font-medium">The face swap didn't finish.</p>
+                  <p className="font-mono text-xs break-words text-muted-foreground">{error}</p>
                 </div>
               ) : (
                 <div className="flex flex-col items-center gap-3 px-6 text-center text-muted-foreground">
@@ -189,25 +199,20 @@ function Index() {
               )}
             </div>
 
-            {status === "done" && (
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <p className="text-xs text-muted-foreground">
-                  Preview only — the swap engine isn't connected yet, so this shows your original clip.
-                </p>
-                <div className="flex gap-2">
-                  <Button variant="secondary" size="sm" onClick={reset}>
-                    <RotateCcw />
-                    Reset
+            {(status === "done" || status === "error") && (
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <Button variant="secondary" size="sm" onClick={reset}>
+                  <RotateCcw />
+                  Reset
+                </Button>
+                {status === "done" && resultUrl && video && (
+                  <Button variant="outline" size="sm" asChild>
+                    <a href={resultUrl} download={`swapped-${video.name.replace(/\.[^.]+$/, "")}.${resultExt}`}>
+                      <Download />
+                      Download
+                    </a>
                   </Button>
-                  {videoUrl && video && (
-                    <Button variant="outline" size="sm" asChild>
-                      <a href={videoUrl} download={`swapped-${video.name}`}>
-                        <Download />
-                        Download
-                      </a>
-                    </Button>
-                  )}
-                </div>
+                )}
               </div>
             )}
           </section>
