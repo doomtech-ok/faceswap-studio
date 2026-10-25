@@ -158,6 +158,13 @@ function Index() {
             <p className="-mt-3 text-center text-xs text-muted-foreground">
               Only use faces and footage you have permission to use.
             </p>
+            <div className="flex items-start gap-2 rounded-lg border border-primary/30 bg-primary/10 p-3 text-xs text-muted-foreground">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-primary" />
+              <span>
+                Processing runs on your computer's processor, so it's slow — roughly a few seconds per frame (10 frames per
+                second of video). Long videos can take a very long time; keep this tab open until it finishes.
+              </span>
+            </div>
           </div>
 
           <section className="flex flex-col gap-3">

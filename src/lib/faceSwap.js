@@ -301,8 +301,8 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
     console.log('Entradas que espera el modelo:', swapperSession.inputNames);
 
     const frames = [];
-    // Solo 5 frames para probar rápido (o menos si el video es muy corto)
-    const totalFrames = Math.min(5, Math.max(1, Math.floor(duration * fps)));
+    // Procesar el video completo a `fps` cuadros por segundo.
+    const totalFrames = Math.max(1, Math.floor(duration * fps));
 
     for (let i = 0; i < totalFrames; i++) {
       const seeked = new Promise((r) => (videoEl.onseeked = r));
