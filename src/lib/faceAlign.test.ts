@@ -1,3 +1,4 @@
+// @ts-nocheck -- JS module under test has loose JSDoc tuple types
 import { describe, expect, it } from 'vitest';
 import {
   ARCFACE_DST,
