@@ -30,26 +30,31 @@ export async function runModel(session, feeds) {
   return await session.run(feeds);
 }
 
-// Inicializa ambos modelos (detector + swapper)
+// Inicializa solo el swapper. WebGPU solo permite crear una sesión a la vez,
+// así que el detector queda fuera por ahora y bloqueamos cargas concurrentes.
+let isLoading = false;
+let loadingPromise = null;
+
 async function ensureModels() {
-  if (!detectorSession) {
-    console.log('Cargando detector...');
-    // The detector isn't used yet, so a missing file must not block the swap.
+  if (swapperSession) return { swapperSession };
+  // Si ya hay una carga en curso, esperamos esa en lugar de crear otra sesión.
+  if (isLoading && loadingPromise) return loadingPromise;
+
+  isLoading = true;
+  loadingPromise = (async () => {
     try {
-      detectorSession = await loadModel('/scrfd_10g_bnkps.onnx');
-      console.log('✅ Detector listo');
-    } catch (e) {
-      console.warn('Detector no disponible (se omite por ahora):', e);
+      console.log('Cargando swapper (puede tardar por el tamaño)...');
+      swapperSession = await loadModel(
+        'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128_fp16.onnx'
+      );
+      console.log('✅ Swapper listo');
+      return { swapperSession };
+    } finally {
+      isLoading = false;
+      loadingPromise = null;
     }
-  }
-  if (!swapperSession) {
-    console.log('Cargando swapper (puede tardar por el tamaño)...');
-    swapperSession = await loadModel(
-      'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128_fp16.onnx'
-    );
-    console.log('✅ Swapper listo');
-  }
-  return { detectorSession, swapperSession };
+  })();
+  return loadingPromise;
 }
 
 // --- Utilidades de imagen ---
