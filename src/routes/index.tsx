@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
-import { Film, ScanFace, Sparkles, Download, RotateCcw } from "lucide-react";
+import { AlertTriangle, Film, ScanFace, Sparkles, Download, RotateCcw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -23,7 +23,7 @@ export const Route = createFileRoute("/")({
 const MAX_IMAGE_MB = 10;
 const MAX_VIDEO_MB = 100;
 
-function useObjectUrl(file: File | null) {
+function useObjectUrl(file: Blob | null) {
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
     if (!file) {
@@ -37,47 +37,56 @@ function useObjectUrl(file: File | null) {
   return url;
 }
 
-type Status = "idle" | "processing" | "done";
+type Status = "idle" | "processing" | "done" | "error";
 
 function Index() {
   const [face, setFace] = useState<File | null>(null);
   const [video, setVideo] = useState<File | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [result, setResult] = useState<Blob | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Each run gets an id so a stale run can't overwrite state after a reset.
+  const runId = useRef(0);
 
   const faceUrl = useObjectUrl(face);
   const videoUrl = useObjectUrl(video);
-
-  useEffect(() => () => {
-    if (timer.current) clearInterval(timer.current);
-  }, []);
+  const resultUrl = useObjectUrl(result);
 
   const reset = () => {
-    if (timer.current) clearInterval(timer.current);
+    runId.current += 1;
     setStatus("idle");
     setProgress(0);
+    setResult(null);
+    setError(null);
   };
 
-  // Placeholder run: no processing engine is connected yet, so this only
-  // animates progress and then shows the target clip in the result player.
-  const start = () => {
+  const start = async () => {
     if (!face || !video) return;
+    const id = ++runId.current;
     setStatus("processing");
     setProgress(0);
-    timer.current = setInterval(() => {
-      setProgress((p) => {
-        const next = Math.min(100, p + 4);
-        if (next >= 100 && timer.current) {
-          clearInterval(timer.current);
-          setStatus("done");
-        }
-        return next;
+    setResult(null);
+    setError(null);
+    try {
+      // Loaded on demand: the AI runtime only works in the browser.
+      const { swapFaces } = await import("@/lib/faceSwap.js");
+      const blob = await swapFaces(face, video, (fraction) => {
+        if (runId.current === id) setProgress(Math.round(fraction * 100));
       });
-    }, 80);
+      if (runId.current !== id) return;
+      setResult(blob);
+      setStatus("done");
+    } catch (e) {
+      if (runId.current !== id) return;
+      console.error("Face swap failed:", e);
+      setError(e instanceof Error ? e.message : String(e));
+      setStatus("error");
+    }
   };
 
   const ready = Boolean(face && video) && status !== "processing";
+  const resultExt = result?.type.includes("mp4") ? "mp4" : "webm";
 
   return (
     <main className="min-h-screen bg-grid">
@@ -161,17 +170,26 @@ function Index() {
                 {status === "idle" && "Waiting"}
                 {status === "processing" && `${progress}%`}
                 {status === "done" && "Ready"}
+                {status === "error" && "Failed"}
               </span>
             </header>
 
             <div className="relative flex aspect-video items-center justify-center overflow-hidden rounded-2xl border bg-surface">
-              {status === "done" && videoUrl ? (
-                <video key={videoUrl} src={videoUrl} controls autoPlay playsInline className="h-full w-full bg-background object-contain" />
+              {status === "done" && resultUrl ? (
+                <video key={resultUrl} src={resultUrl} controls autoPlay playsInline className="h-full w-full bg-background object-contain" />
               ) : status === "processing" ? (
                 <div className="flex w-full max-w-xs flex-col items-center gap-4 px-6 text-center">
                   <ScanFace className="size-8 animate-pulse text-primary" />
                   <Progress value={progress} className="h-1.5 bg-muted [&>div]:bg-primary" />
-                  <p className="font-mono text-xs text-muted-foreground">Processing frames…</p>
+                  <p className="font-mono text-xs text-muted-foreground">
+                    {progress === 0 ? "Loading models… this can take a while the first time" : "Processing frames…"}
+                  </p>
+                </div>
+              ) : status === "error" ? (
+                <div className="flex max-w-md flex-col items-center gap-3 px-6 text-center">
+                  <AlertTriangle className="size-8 text-destructive" />
+                  <p className="text-sm font-medium">The face swap didn't finish.</p>
+                  <p className="font-mono text-xs break-words text-muted-foreground">{error}</p>
                 </div>
               ) : (
                 <div className="flex flex-col items-center gap-3 px-6 text-center text-muted-foreground">
@@ -181,25 +199,20 @@ function Index() {
               )}
             </div>
 
-            {status === "done" && (
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <p className="text-xs text-muted-foreground">
-                  Preview only — the swap engine isn't connected yet, so this shows your original clip.
-                </p>
-                <div className="flex gap-2">
-                  <Button variant="secondary" size="sm" onClick={reset}>
-                    <RotateCcw />
-                    Reset
+            {(status === "done" || status === "error") && (
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <Button variant="secondary" size="sm" onClick={reset}>
+                  <RotateCcw />
+                  Reset
+                </Button>
+                {status === "done" && resultUrl && video && (
+                  <Button variant="outline" size="sm" asChild>
+                    <a href={resultUrl} download={`swapped-${video.name.replace(/\.[^.]+$/, "")}.${resultExt}`}>
+                      <Download />
+                      Download
+                    </a>
                   </Button>
-                  {videoUrl && video && (
-                    <Button variant="outline" size="sm" asChild>
-                      <a href={videoUrl} download={`swapped-${video.name}`}>
-                        <Download />
-                        Download
-                      </a>
-                    </Button>
-                  )}
-                </div>
+                )}
               </div>
             )}
           </section>

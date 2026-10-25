@@ -11,7 +11,7 @@
 
 ## Project rules
 
-- Face-swap UI is frontend-only for now: uploads stay in the browser as object URLs and the "Start" action is a placeholder; why: the user asked for no backend or database yet.
+- Face-swap runs fully in the browser: uploads stay as object URLs and "Start" calls `swapFaces` from `src/lib/faceSwap.js`; why: the user asked for no backend or database.
 - Face-swap UI pieces live in `src/components/face-swap/`; why: keeps the single-page tool's parts together.
 - The app is dark-only (tokens defined in `:root`, no `.dark` toggle); why: the requested design is a dark theme.
 - Face-swap AI logic lives in `src/lib/faceSwap.js`, imports `onnxruntime-web/webgpu` (not the default entry), and is loaded only via dynamic `import()` on the client; why: the user requested WebGPU, and ORT uses browser APIs that break SSR.
