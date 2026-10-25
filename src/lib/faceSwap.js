@@ -45,7 +45,7 @@ async function ensureModels() {
   if (!swapperSession) {
     console.log('Cargando swapper (puede tardar por el tamaño)...');
     swapperSession = await loadModel(
-      'https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx'
+      'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128_fp16.onnx'
     );
     console.log('✅ Swapper listo');
   }
