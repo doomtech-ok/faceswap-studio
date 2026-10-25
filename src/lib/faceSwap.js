@@ -20,9 +20,12 @@ export function isWebGpuAvailable() {
   return typeof navigator !== 'undefined' && !!navigator.gpu;
 }
 
-export async function loadModel(modelUrl) {
+// Pass `executionProviders` to force a backend (e.g. ['wasm']); by default
+// WebGPU is used when available, falling back to WASM.
+export async function loadModel(modelUrl, executionProviders) {
   return await ort.InferenceSession.create(modelUrl, {
-    executionProviders: isWebGpuAvailable() ? ['webgpu', 'wasm'] : ['wasm'],
+    executionProviders:
+      executionProviders ?? (isWebGpuAvailable() ? ['webgpu', 'wasm'] : ['wasm']),
   });
 }
 
@@ -45,9 +48,11 @@ async function ensureModels() {
     try {
       // Carga secuencial (una sesión a la vez) para no bloquear WebGPU.
       if (!swapperSession) {
-        console.log('Cargando swapper (puede tardar por el tamaño)...');
+        console.log('Cargando swapper en WASM (puede tardar por el tamaño)...');
+        // Precisión completa y solo WASM: la RX 580 no soporta shader-f16 en WebGPU.
         swapperSession = await loadModel(
-          'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128_fp16.onnx'
+          'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128.onnx',
+          ['wasm']
         );
         console.log('✅ Swapper listo');
       }
