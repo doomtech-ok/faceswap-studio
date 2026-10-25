@@ -216,11 +216,9 @@ function canvasToTensor(canvas, size) {
   return new ort.Tensor('float32', floatData, [1, 3, size, size]);
 }
 
-// Reads a planar NCHW [1, 3, size, size] output in [0, 1] into a canvas.
-function tensorToCanvas(outData, size) {
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = size;
-  outCanvas.height = size;
+// Reads a planar NCHW [1, 3, size, size] output in [0, 1] into `outCanvas`
+// (reused across frames so no new canvas is created per frame).
+function tensorToCanvas(outData, size, outCanvas) {
   const outCtx = outCanvas.getContext('2d');
   const imgData = outCtx.createImageData(size, size);
   const plane = size * size;
@@ -233,6 +231,20 @@ function tensorToCanvas(outData, size) {
   outCtx.putImageData(imgData, 0, 0);
   return outCanvas;
 }
+
+// Guarda el frame como JPEG comprimido (~100 KB) en lugar de ImageData sin
+// comprimir (~8 MB en 1080p), que era lo que agotaba la memoria.
+function canvasToBlob(canvas) {
+  return new Promise((resolve, reject) =>
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error('No se pudo guardar el fotograma.'))),
+      'image/jpeg',
+      0.92
+    )
+  );
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function pickRecorderMimeType() {
   const candidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
@@ -292,64 +304,84 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
 
     const fps = 10; // procesamos 10 fps para no saturar la RX 580
 
+    // Canvas temporales: se crean una sola vez y se reutilizan en cada frame.
     const faceCanvas = document.createElement('canvas');
     faceCanvas.width = 128;
     faceCanvas.height = 128;
     const faceCtx = faceCanvas.getContext('2d', { willReadFrequently: true });
+    const swapOutCanvas = document.createElement('canvas');
+    swapOutCanvas.width = 128;
+    swapOutCanvas.height = 128;
 
     // Mueve el console.log de las entradas AQUÍ, antes del bucle
     console.log('Entradas que espera el modelo:', swapperSession.inputNames);
 
-    const frames = [];
-    // Procesar el video completo a `fps` cuadros por segundo.
+    const CHUNK_SIZE = 10; // fotogramas por bloque
+    const frameBlobs = [];
+    // Procesar el video completo a `fps` cuadros por segundo, en bloques.
     const totalFrames = Math.max(1, Math.floor(duration * fps));
+    const totalChunks = Math.ceil(totalFrames / CHUNK_SIZE);
 
-    for (let i = 0; i < totalFrames; i++) {
-      const seeked = new Promise((r) => (videoEl.onseeked = r));
-      videoEl.currentTime = i / fps;
-      await seeked;
+    for (let chunk = 0; chunk < totalChunks; chunk++) {
+      const start = chunk * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, totalFrames);
 
-      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      for (let i = start; i < end; i++) {
+        const seeked = new Promise((r) => (videoEl.onseeked = r));
+        videoEl.currentTime = i / fps;
+        await seeked;
 
-      // Detectar el rostro con SCRFD. Si no hay rostro, el frame queda igual.
-      const face = await detectFace(canvas, canvas.width, canvas.height);
-      if (face && face.kps.length === 5) {
-        if (i === 0) console.log('Rostro detectado en el frame 0:', face);
-        // Alinear el rostro a 128x128 con los 5 keypoints (plantilla ArcFace).
-        const matrix = alignMatrix(face.kps, 128);
-        warpAligned(faceCtx, canvas, matrix, 128);
+        ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
 
-        // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
-        const targetTensor = canvasToTensor(faceCanvas, 128);
+        // Detectar el rostro con SCRFD. Si no hay rostro, el frame queda igual.
+        const face = await detectFace(canvas, canvas.width, canvas.height);
+        if (face && face.kps.length === 5) {
+          if (i === 0) console.log('Rostro detectado en el frame 0:', face);
+          // Alinear el rostro a 128x128 con los 5 keypoints (plantilla ArcFace).
+          const matrix = alignMatrix(face.kps, 128);
+          warpAligned(faceCtx, canvas, matrix, 128);
 
-        let output;
-        try {
-          output = await swapperSession.run({
-            target: targetTensor,
-            source: sourceEmbedding, // [1, 512]
-          });
-        } catch (e) {
-          throw new Error(
-            'El swapper rechazó las entradas. inswapper_128 espera "source" como un ' +
-              'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
-              `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
-          );
+          // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
+          const targetTensor = canvasToTensor(faceCanvas, 128);
+
+          let output;
+          try {
+            output = await swapperSession.run({
+              target: targetTensor,
+              source: sourceEmbedding, // [1, 512]
+            });
+          } catch (e) {
+            throw new Error(
+              'El swapper rechazó las entradas. inswapper_128 espera "source" como un ' +
+                'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
+                `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
+            );
+          }
+
+          // Tomar la salida y devolverla al frame con la transformación inversa.
+          const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
+          tensorToCanvas(output[outKey].data, 128, swapOutCanvas);
+          pasteAligned(ctx, swapOutCanvas, matrix);
+          // Liberar los tensores de este frame.
+          targetTensor.dispose?.();
+          for (const t of Object.values(output)) t.dispose?.();
+        } else {
+          console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
         }
 
-        // Tomar la salida y devolverla al frame con la transformación inversa.
-        const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
-        const outCanvas = tensorToCanvas(output[outKey].data, 128);
-        pasteAligned(ctx, outCanvas, matrix);
-      } else {
-        console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
+        frameBlobs.push(await canvasToBlob(canvas));
+
+        // Al final de cada iteración, cede el hilo
+        await sleep(100);
+
+        if (onProgress) onProgress((i + 1) / totalFrames);
       }
 
-      frames.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
-
-      // Al final de cada iteración, cede el hilo
-      await new Promise((r) => setTimeout(r, 100));
-
-      if (onProgress) onProgress((i + 1) / totalFrames);
+      // Fin del bloque: limpiar los canvas temporales y dar un respiro mayor.
+      faceCtx.clearRect(0, 0, 128, 128);
+      swapOutCanvas.getContext('2d').clearRect(0, 0, 128, 128);
+      console.log(`Bloque ${chunk + 1} procesado (${end}/${totalFrames} fotogramas)`);
+      await sleep(300);
     }
 
     // 3. Codificar los frames a un nuevo video
@@ -363,9 +395,16 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
     const done = new Promise((r) => (recorder.onstop = r));
 
     recorder.start();
-    for (const frameData of frames) {
-      ctx.putImageData(frameData, 0, 0);
-      await new Promise((r) => setTimeout(r, 1000 / fps));
+    // Decodificamos el siguiente JPEG mientras se muestra el actual, y soltamos
+    // cada uno en cuanto se dibuja.
+    let next = createImageBitmap(frameBlobs[0]);
+    for (let i = 0; i < frameBlobs.length; i++) {
+      const bitmap = await next;
+      frameBlobs[i] = null;
+      next = i + 1 < frameBlobs.length ? createImageBitmap(frameBlobs[i + 1]) : null;
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+      await sleep(1000 / fps);
     }
     recorder.stop();
     await done;
