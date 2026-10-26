@@ -40,6 +40,47 @@ function useObjectUrl(file: Blob | null) {
 }
 
 type Status = "idle" | "processing" | "done" | "error";
+type ModelStatus = "loading" | "ready" | "error";
+
+const RESULT_FILENAME = "faceswap_result.mp4";
+
+function useModelPreload() {
+  const [modelStatus, setModelStatus] = useState<ModelStatus>("loading");
+  const [modelProgress, setModelProgress] = useState(0);
+  const [modelLabel, setModelLabel] = useState("Starting…");
+  const [modelError, setModelError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    setModelStatus("loading");
+    setModelError(null);
+    (async () => {
+      try {
+        // Loaded on demand: the AI runtime only works in the browser.
+        const { preloadModels } = await import("@/lib/faceSwap.js");
+        await preloadModels((s: { fraction: number; label: string }) => {
+          if (!active) return;
+          setModelProgress(Math.round(s.fraction * 100));
+          setModelLabel(s.label);
+        });
+        if (!active) return;
+        setModelProgress(100);
+        setModelStatus("ready");
+      } catch (e) {
+        if (!active) return;
+        console.error("Model loading failed:", e);
+        setModelError(e instanceof Error ? e.message : String(e));
+        setModelStatus("error");
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [attempt]);
+
+  return { modelStatus, modelProgress, modelLabel, modelError, retry: () => setAttempt((a) => a + 1) };
+}
 
 function Index() {
   const [face, setFace] = useState<File | null>(null);
@@ -49,6 +90,8 @@ function Index() {
   const [result, setResult] = useState<Blob | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [highQuality, setHighQuality] = useState(false);
+  const { modelStatus, modelProgress, modelLabel, modelError, retry } = useModelPreload();
+  const modelsReady = modelStatus === "ready";
   // Each run gets an id so a stale run can't overwrite state after a reset.
   const runId = useRef(0);
 
@@ -65,14 +108,13 @@ function Index() {
   };
 
   const start = async () => {
-    if (!face || !video) return;
+    if (!face || !video || !modelsReady) return;
     const id = ++runId.current;
     setStatus("processing");
     setProgress(0);
     setResult(null);
     setError(null);
     try {
-      // Loaded on demand: the AI runtime only works in the browser.
       const { swapFaces } = await import("@/lib/faceSwap.js");
       const blob = await swapFaces(
         face,
@@ -83,7 +125,7 @@ function Index() {
         { highQuality },
       );
       if (runId.current !== id) return;
-      setResult(blob);
+      setResult(blob.type === "video/mp4" ? blob : new Blob([blob], { type: "video/mp4" }));
       setStatus("done");
     } catch (e) {
       if (runId.current !== id) return;
@@ -93,8 +135,7 @@ function Index() {
     }
   };
 
-  const ready = Boolean(face && video) && status !== "processing";
-  const resultExt = result?.type.includes("mp4") ? "mp4" : "webm";
+  const ready = Boolean(face && video) && modelsReady && status !== "processing";
 
   return (
     <main className="min-h-screen bg-grid">
