@@ -479,3 +479,4 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
     URL.revokeObjectURL(videoEl.src);
   }
 }
+export const __test = { createEncoder, pasteAligned };
