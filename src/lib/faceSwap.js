@@ -15,13 +15,13 @@ import { fitWithin, pickWasmThreads, shouldDetect } from './imageOps.js';
 
 // WASM multihilo (el swapper corre en CPU). Solo funciona si la página está
 // aislada (crossOriginIsolated); si no, ORT usaría 1 hilo de todas formas.
-const isolated = typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated;
+const canUseThreads =
+  typeof SharedArrayBuffer !== 'undefined' &&
+  typeof window !== 'undefined' &&
+  window.crossOriginIsolated === true;
 ort.env.wasm.simd = true;
-ort.env.wasm.numThreads = pickWasmThreads(
-  typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 4,
-  isolated
-);
-if (isolated) {
+ort.env.wasm.numThreads = canUseThreads ? 8 : 1;
+if (canUseThreads) {
   console.log(`WASM con ${ort.env.wasm.numThreads} hilos`);
 } else {
   console.warn(
