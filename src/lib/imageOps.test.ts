@@ -1,6 +1,6 @@
 // @ts-nocheck -- JS module under test has loose JSDoc types
 import { describe, expect, it } from 'vitest';
-import { fitWithin, sharpenRGBA, shouldDetect } from './imageOps.js';
+import { fitWithin, pickWasmThreads, shouldDetect } from './imageOps.js';
 
 describe('fitWithin (720p working canvas)', () => {
   it('shrinks 1080p landscape to 1280x720', () => {
@@ -26,19 +26,14 @@ describe('shouldDetect (detector every 5 frames)', () => {
   });
 });
 
-describe('sharpenRGBA', () => {
-  it('leaves a flat image unchanged', () => {
-    const data = new Uint8ClampedArray(4 * 4 * 4).fill(100);
-    sharpenRGBA(data, 4, 4, 1);
-    expect(Array.from(data).every((v) => v === 100)).toBe(true);
+describe('pickWasmThreads', () => {
+  it('uses 8 threads on a 12-thread CPU (Ryzen 5 5600) when isolated', () => {
+    expect(pickWasmThreads(12, true)).toBe(8);
   });
-  it('increases contrast across an edge and keeps alpha', () => {
-    // 4x1 image: dark | dark | light | light
-    const vals = [50, 50, 200, 200];
-    const data = new Uint8ClampedArray(vals.flatMap((v) => [v, v, v, 255]));
-    sharpenRGBA(data, 4, 1, 1);
-    expect(data[4]).toBeLessThan(50); // dark side of the edge gets darker
-    expect(data[8]).toBeGreaterThan(200); // light side gets lighter
-    expect(data[7]).toBe(255);
+  it('uses all cores when there are fewer than 8', () => {
+    expect(pickWasmThreads(4, true)).toBe(4);
+  });
+  it('falls back to 1 thread without cross-origin isolation', () => {
+    expect(pickWasmThreads(12, false)).toBe(1);
   });
 });
