@@ -148,7 +148,7 @@ function pasteAligned(ctx, face, matrix) {
   const s = Math.hypot(matrix[0], matrix[1]);
   const up = Math.min(MAX_UPSCALE, Math.max(size, Math.ceil(size / s)));
   if (!pasteCanvas) pasteCanvas = document.createElement('canvas');
-  if (pasteCanvas.width !== up) {
+  if (pasteCanvas.width !== up || pasteCanvas.height !== up) {
     pasteCanvas.width = up;
     pasteCanvas.height = up;
   }
