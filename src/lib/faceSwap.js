@@ -11,9 +11,11 @@ import * as ort from 'onnxruntime-web/webgpu';
 ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = 1;
 
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { extractEmap, projectEmbedding } from './onnxEmap.js';
 import { DET_SIZE, rgbaToDetInput, decodeScrfd } from './scrfd.js';
 import { alignMatrix, invertMatrix } from './faceAlign.js';
+import { fitWithin, sharpenRGBA, shouldDetect } from './imageOps.js';
 
 const SWAPPER_URL =
   'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128.onnx';
@@ -133,29 +135,47 @@ function warpAligned(outCtx, source, matrix, size) {
 }
 
 // Pega `face` (alineado, 128x128) de vuelta en el frame con la transformación
-// inversa, usando una máscara con bordes suavizados para que no se note el corte.
+// inversa. Para que no quede borroso, primero se amplía al tamaño real que
+// tendrá en el frame (suavizado 'high') y se le aplica un filtro de enfoque
+// (unsharp mask); después se aplica la máscara de bordes suavizados.
+const SHARPEN_AMOUNT = 0.7;
+const MAX_UPSCALE = 512;
 let pasteCanvas = null;
 function pasteAligned(ctx, face, matrix) {
   const size = face.width;
-  if (!pasteCanvas) {
-    pasteCanvas = document.createElement('canvas');
-    pasteCanvas.width = size;
-    pasteCanvas.height = size;
+  // matrix lleva imagen -> recorte; su escala dice cuántos px del frame ocupa
+  // cada px del recorte.
+  const s = Math.hypot(matrix[0], matrix[1]);
+  const up = Math.min(MAX_UPSCALE, Math.max(size, Math.ceil(size / s)));
+  if (!pasteCanvas) pasteCanvas = document.createElement('canvas');
+  if (pasteCanvas.width !== up) {
+    pasteCanvas.width = up;
+    pasteCanvas.height = up;
   }
-  const t = pasteCanvas.getContext('2d');
+  const t = pasteCanvas.getContext('2d', { willReadFrequently: true });
   t.globalCompositeOperation = 'source-over';
-  t.clearRect(0, 0, size, size);
-  t.drawImage(face, 0, 0);
-  const r = size / 2;
+  t.clearRect(0, 0, up, up);
+  t.imageSmoothingEnabled = true;
+  t.imageSmoothingQuality = 'high';
+  t.drawImage(face, 0, 0, up, up);
+
+  const img = t.getImageData(0, 0, up, up);
+  sharpenRGBA(img.data, up, up, SHARPEN_AMOUNT);
+  t.putImageData(img, 0, 0);
+
+  const r = up / 2;
   const grad = t.createRadialGradient(r, r, r * 0.65, r, r, r);
   grad.addColorStop(0, 'rgba(0,0,0,1)');
   grad.addColorStop(1, 'rgba(0,0,0,0)');
   t.globalCompositeOperation = 'destination-in';
   t.fillStyle = grad;
-  t.fillRect(0, 0, size, size);
+  t.fillRect(0, 0, up, up);
+  t.globalCompositeOperation = 'source-over';
 
   ctx.save();
   ctx.setTransform(...invertMatrix(matrix));
+  ctx.scale(size / up, size / up);
+  ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(pasteCanvas, 0, 0);
   ctx.restore();
@@ -232,23 +252,74 @@ function tensorToCanvas(outData, size, outCanvas) {
   return outCanvas;
 }
 
-// Guarda el frame como JPEG comprimido (~100 KB) en lugar de ImageData sin
-// comprimir (~8 MB en 1080p), que era lo que agotaba la memoria.
-function canvasToBlob(canvas) {
-  return new Promise((resolve, reject) =>
-    canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error('No se pudo guardar el fotograma.'))),
-      'image/jpeg',
-      0.92
-    )
-  );
-}
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function pickRecorderMimeType() {
-  const candidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
-  return candidates.find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
+// --- Codificación con WebCodecs ---
+
+// Crea un VideoEncoder (H.264 si se puede, si no VP9) que escribe directo a un
+// MP4 en memoria. Cada frame se codifica en cuanto se termina, sin guardarlo.
+async function createEncoder(width, height, fps) {
+  if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
+    throw new Error(
+      'Este navegador no soporta WebCodecs (VideoEncoder). Usa una versión reciente de Chrome, Edge o Firefox.'
+    );
+  }
+  const base = { width, height, bitrate: 5_000_000, framerate: fps };
+  const candidates = [
+    { mux: 'avc', config: { ...base, codec: 'avc1.4d0028', avc: { format: 'avc' } } }, // H.264 Main 4.0
+    { mux: 'avc', config: { ...base, codec: 'avc1.42001f', avc: { format: 'avc' } } }, // H.264 Baseline 3.1
+    { mux: 'vp9', config: { ...base, codec: 'vp09.00.31.08' } }, // VP9
+  ];
+  let chosen = null;
+  for (const c of candidates) {
+    try {
+      const { supported } = await VideoEncoder.isConfigSupported(c.config);
+      if (supported) {
+        chosen = c;
+        break;
+      }
+    } catch {
+      // probar el siguiente
+    }
+  }
+  if (!chosen) throw new Error(`El navegador no puede codificar video ${width}x${height} en H.264 ni VP9.`);
+  console.log('Codificando con', chosen.config.codec);
+
+  const muxer = new Muxer({
+    target: new ArrayBufferTarget(),
+    video: { codec: chosen.mux, width, height, frameRate: fps },
+    fastStart: 'in-memory',
+  });
+  let encodeError = null;
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: (e) => {
+      encodeError = e;
+    },
+  });
+  encoder.configure(chosen.config);
+
+  const frameDuration = Math.round(1e6 / fps);
+  return {
+    async addFrame(canvas, index) {
+      if (encodeError) throw encodeError;
+      const frame = new VideoFrame(canvas, { timestamp: index * frameDuration, duration: frameDuration });
+      encoder.encode(frame, { keyFrame: index % (fps * 2) === 0 }); // keyframe cada 2 s
+      frame.close();
+      // Si el codificador se atrasa, esperamos para no acumular frames en memoria.
+      while (encoder.encodeQueueSize > 4) await sleep(5);
+    },
+    async finish() {
+      await encoder.flush();
+      if (encodeError) throw encodeError;
+      encoder.close();
+      muxer.finalize();
+      return new Blob([muxer.target.buffer], { type: 'video/mp4' });
+    },
+    close() {
+      if (encoder.state !== 'closed') encoder.close();
+    },
+  };
 }
 
 // --- Procesamiento de video ---
