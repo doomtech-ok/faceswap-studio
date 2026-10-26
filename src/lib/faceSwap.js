@@ -10,7 +10,7 @@ import * as ort from 'onnxruntime-web/webgpu';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { extractEmap, projectEmbedding } from './onnxEmap.js';
 import { DET_SIZE, rgbaToDetInput, decodeScrfd } from './scrfd.js';
-import { alignMatrix, invertMatrix } from './faceAlign.js';
+import { alignMatrix, ffhqMatrix, invertMatrix } from './faceAlign.js';
 import { fitWithin, shouldDetect } from './imageOps.js';
 
 // WASM multihilo (el swapper corre en CPU). Solo funciona si la página está
@@ -35,10 +35,18 @@ const SWAPPER_URL =
 // SCRFD 10G con keypoints (det_10g de InsightFace buffalo_l), ~17 MB.
 const DETECTOR_URL = 'https://huggingface.co/maze/faceX/resolve/main/det_10g.onnx';
 const RECOGNIZER_URL = 'https://huggingface.co/maze/faceX/resolve/main/w600k_r50.onnx';
+// GFPGAN 1.4 (restauración facial), ~340 MB. Entrada "input" [1,3,512,512] RGB
+// en [-1,1]; salida "output" con la misma forma y rango.
+const RESTORER_URL = 'https://huggingface.co/facefusion/models-3.0.0/resolve/main/gfpgan_1.4.onnx';
+const RESTORE_SIZE = 512;
+// Mezcla del rostro restaurado sobre el swap (como FaceFusion, 80 %).
+const RESTORE_BLEND = 0.8;
 
 let detectorSession = null;
 let swapperSession = null;
 let recognizerSession = null;
+let restorerSession = null;
+let restorerBackend = null; // 'webgpu' | 'wasm'
 let emap = null; // Float32Array 512x512 (fila mayor)
 
 export { ort };
@@ -65,12 +73,17 @@ export async function runModel(session, feeds) {
 let isLoading = false;
 let loadingPromise = null;
 
-async function ensureModels() {
-  if (detectorSession && swapperSession && recognizerSession) {
-    return { detectorSession, swapperSession, recognizerSession };
+async function ensureModels({ highQuality = false } = {}) {
+  const ready = () => detectorSession && swapperSession && recognizerSession && (!highQuality || restorerSession);
+  if (ready()) {
+    return { detectorSession, swapperSession, recognizerSession, restorerSession };
   }
-  // Si ya hay una carga en curso, esperamos esa en lugar de crear otra sesión.
-  if (isLoading && loadingPromise) return loadingPromise;
+  // Si ya hay una carga en curso, esperamos esa (y luego cargamos lo que falte)
+  // en lugar de crear otra sesión a la vez.
+  if (isLoading && loadingPromise) {
+    await loadingPromise.catch(() => {});
+    return ensureModels({ highQuality });
+  }
 
   isLoading = true;
   loadingPromise = (async () => {
@@ -99,13 +112,33 @@ async function ensureModels() {
         recognizerSession = await loadModel(RECOGNIZER_URL);
         console.log('✅ Reconocedor listo');
       }
-      return { detectorSession, swapperSession, recognizerSession };
+      if (highQuality && !restorerSession) await loadRestorer();
+      return { detectorSession, swapperSession, recognizerSession, restorerSession };
     } finally {
       isLoading = false;
       loadingPromise = null;
     }
   })();
   return loadingPromise;
+}
+
+// GFPGAN se intenta en WebGPU (es pesado para CPU) y, si falla al crear la
+// sesión, se carga en WASM. Solo se llama dentro de ensureModels (una a la vez).
+async function loadRestorer(forceWasm = false) {
+  console.log('Descargando GFPGAN 1.4 (~340 MB, solo la primera vez)...');
+  if (!forceWasm && isWebGpuAvailable()) {
+    try {
+      restorerSession = await loadModel(RESTORER_URL, ['webgpu']);
+      restorerBackend = 'webgpu';
+      console.log('✅ GFPGAN listo (WebGPU)');
+      return;
+    } catch (e) {
+      console.warn('GFPGAN no pudo cargarse en WebGPU, se usa WASM:', e);
+    }
+  }
+  restorerSession = await loadModel(RESTORER_URL, ['wasm']);
+  restorerBackend = 'wasm';
+  console.log('✅ GFPGAN listo (WASM)');
 }
 
 // --- Detección de rostros (SCRFD) ---
@@ -182,6 +215,109 @@ function pasteAligned(ctx, face, matrix) {
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(pasteCanvas, 0, 0);
   ctx.restore();
+}
+
+// --- Restauración facial (GFPGAN) ---
+
+let restoreInCanvas = null;
+let restoreOutCanvas = null;
+let restoreMask = null;
+
+function getRestoreCanvases() {
+  if (!restoreInCanvas) {
+    const make = () => {
+      const c = document.createElement('canvas');
+      c.width = RESTORE_SIZE;
+      c.height = RESTORE_SIZE;
+      return c;
+    };
+    restoreInCanvas = make();
+    restoreOutCanvas = make();
+    // Máscara elíptica con bordes suaves: cubre el rostro y se desvanece antes
+    // de llegar al pelo y al fondo del recorte.
+    restoreMask = make();
+    const m = restoreMask.getContext('2d');
+    const r = RESTORE_SIZE / 2;
+    const grad = m.createRadialGradient(r, r * 1.08, r * 0.55, r, r * 1.08, r * 0.92);
+    grad.addColorStop(0, 'rgba(0,0,0,1)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    m.fillStyle = grad;
+    m.fillRect(0, 0, RESTORE_SIZE, RESTORE_SIZE);
+  }
+  return { inCanvas: restoreInCanvas, outCanvas: restoreOutCanvas, mask: restoreMask };
+}
+
+async function runRestorer(tensor) {
+  const inputName = restorerSession.inputNames[0] ?? 'input';
+  try {
+    return await restorerSession.run({ [inputName]: tensor });
+  } catch (e) {
+    if (restorerBackend !== 'webgpu') throw e;
+    // Algunas GPUs crean la sesión pero fallan al ejecutar: pasar a WASM una vez.
+    console.warn('GFPGAN falló en WebGPU, se reintenta en WASM:', e);
+    await restorerSession.release?.();
+    restorerSession = null;
+    await loadRestorer(true);
+    return await restorerSession.run({ [restorerSession.inputNames[0] ?? 'input']: tensor });
+  }
+}
+
+// Mejora el rostro ya intercambiado dentro de `ctx` (el frame completo):
+// 1. recorta el rostro a 512x512 con el encuadre FFHQ que GFPGAN conoce,
+// 2. lo pasa por GFPGAN,
+// 3. pega el resultado de vuelta con la transformación inversa y una máscara suave.
+async function restoreFace(ctx, frameCanvas, kps) {
+  const { inCanvas, outCanvas, mask } = getRestoreCanvases();
+  const size = RESTORE_SIZE;
+  const matrix = ffhqMatrix(kps, size);
+
+  const inCtx = inCanvas.getContext('2d', { willReadFrequently: true });
+  warpAligned(inCtx, frameCanvas, matrix, size);
+  const rgba = inCtx.getImageData(0, 0, size, size).data;
+  const plane = size * size;
+  const input = new Float32Array(plane * 3);
+  for (let i = 0; i < plane; i++) {
+    // GFPGAN: RGB normalizado a [-1, 1].
+    input[i] = rgba[i * 4] / 127.5 - 1;
+    input[i + plane] = rgba[i * 4 + 1] / 127.5 - 1;
+    input[i + 2 * plane] = rgba[i * 4 + 2] / 127.5 - 1;
+  }
+  const tensor = new ort.Tensor('float32', input, [1, 3, size, size]);
+
+  let output;
+  console.time('restoreFrame');
+  try {
+    output = await runRestorer(tensor);
+  } finally {
+    console.timeEnd('restoreFrame');
+  }
+  const outTensor = output[restorerSession.outputNames[0] ?? Object.keys(output)[0]];
+  const out = outTensor.data;
+
+  const outCtx = outCanvas.getContext('2d');
+  const img = outCtx.createImageData(size, size);
+  for (let i = 0; i < plane; i++) {
+    // [-1, 1] -> [0, 255]; Uint8ClampedArray recorta lo que se salga del rango.
+    img.data[i * 4] = (out[i] + 1) * 127.5;
+    img.data[i * 4 + 1] = (out[i + plane] + 1) * 127.5;
+    img.data[i * 4 + 2] = (out[i + 2 * plane] + 1) * 127.5;
+    img.data[i * 4 + 3] = 255;
+  }
+  outCtx.putImageData(img, 0, 0);
+  outCtx.globalCompositeOperation = 'destination-in';
+  outCtx.drawImage(mask, 0, 0);
+  outCtx.globalCompositeOperation = 'source-over';
+
+  ctx.save();
+  ctx.setTransform(...invertMatrix(matrix));
+  ctx.globalAlpha = RESTORE_BLEND;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(outCanvas, 0, 0);
+  ctx.restore();
+
+  tensor.dispose?.();
+  for (const t of Object.values(output)) t.dispose?.();
 }
 
 // Extrae el embedding facial [1,512] con el reconocedor (ArcFace w600k_r50)
@@ -338,11 +474,15 @@ async function createEncoder(width, height, fps) {
  * @param {File | Blob} faceImage source face image
  * @param {File | Blob} videoFile target video
  * @param {(fraction: number) => void} [onProgress] called with 0..1
+ * @param {{ highQuality?: boolean }} [options] highQuality: pass each swapped
+ *   face through GFPGAN (sharper, much slower)
  * @returns {Promise<Blob>} the processed video
  */
-export async function swapFaces(faceImage, videoFile, onProgress) {
-  // El detector se carga primero; los tres modelos quedan listos antes del bucle.
-  const { swapperSession } = await ensureModels();
+export async function swapFaces(faceImage, videoFile, onProgress, options = {}) {
+  const highQuality = options.highQuality === true;
+  // El detector se carga primero; todos los modelos quedan listos antes del bucle.
+  const { swapperSession } = await ensureModels({ highQuality });
+  console.log(highQuality ? 'Modo alta calidad: GFPGAN activado' : 'Modo rápido: sin GFPGAN');
 
   // 1. Preparar el rostro fuente: detectar la cara en la foto, alinearla con
   // sus 5 keypoints y sacar el embedding [1,512] solo de ese rostro.
@@ -464,6 +604,8 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
           const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
           tensorToCanvas(output[outKey].data, 128, swapOutCanvas);
           pasteAligned(ctx, swapOutCanvas, matrix);
+          // Alta calidad: restaurar el rostro intercambiado con GFPGAN a 512x512.
+          if (highQuality) await restoreFace(ctx, canvas, face.kps);
           // Liberar los tensores de este frame.
           targetTensor.dispose?.();
           for (const t of Object.values(output)) t.dispose?.();
