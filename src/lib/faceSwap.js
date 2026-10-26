@@ -480,3 +480,4 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
   }
 }
 export const __test = { createEncoder, pasteAligned };
+export const __dbg = () => pasteCanvas;
