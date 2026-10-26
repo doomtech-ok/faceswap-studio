@@ -4,6 +4,8 @@ import { AlertTriangle, Film, ScanFace, Sparkles, Download, RotateCcw } from "lu
 
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 import { UploadZone } from "@/components/face-swap/UploadZone";
 
 export const Route = createFileRoute("/")({
@@ -46,6 +48,7 @@ function Index() {
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState<Blob | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [highQuality, setHighQuality] = useState(false);
   // Each run gets an id so a stale run can't overwrite state after a reset.
   const runId = useRef(0);
 
@@ -71,9 +74,14 @@ function Index() {
     try {
       // Loaded on demand: the AI runtime only works in the browser.
       const { swapFaces } = await import("@/lib/faceSwap.js");
-      const blob = await swapFaces(face, video, (fraction) => {
-        if (runId.current === id) setProgress(Math.round(fraction * 100));
-      });
+      const blob = await swapFaces(
+        face,
+        video,
+        (fraction) => {
+          if (runId.current === id) setProgress(Math.round(fraction * 100));
+        },
+        { highQuality },
+      );
       if (runId.current !== id) return;
       setResult(blob);
       setStatus("done");
@@ -150,6 +158,25 @@ function Index() {
                 return null;
               }}
             />
+
+            <div className="flex items-center justify-between gap-4 rounded-lg border bg-surface px-4 py-3">
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="hq-toggle" className="cursor-pointer">
+                  Enable High Quality (GFPGAN)
+                </Label>
+                <span className="text-xs text-muted-foreground">
+                  {highQuality
+                    ? "Sharper face, much slower. Downloads an extra 340 MB the first time."
+                    : "Fast mode: the face may look a little soft."}
+                </span>
+              </div>
+              <Switch
+                id="hq-toggle"
+                checked={highQuality}
+                onCheckedChange={setHighQuality}
+                disabled={status === "processing"}
+              />
+            </div>
 
             <Button variant="action" size="xl" disabled={!ready} onClick={start} className="w-full">
               <Sparkles />
