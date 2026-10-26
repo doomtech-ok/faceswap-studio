@@ -7,6 +7,8 @@ import {
   estimateSimilarity,
   invertMatrix,
   templateFor,
+  ffhqMatrix,
+  FFHQ_TEMPLATE,
 } from './faceAlign.js';
 
 describe('face alignment', () => {
@@ -42,5 +44,17 @@ describe('face alignment', () => {
     const back = applyMatrix(invertMatrix(m), applyMatrix(m, [123, 456]));
     expect(back[0]).toBeCloseTo(123, 6);
     expect(back[1]).toBeCloseTo(456, 6);
+  });
+});
+
+describe('FFHQ alignment for the GFPGAN restorer', () => {
+  it('maps the 5 keypoints onto the FFHQ template in a 512 crop', () => {
+    const kps = [[300, 210], [360, 214], [330, 250], [305, 280], [355, 282]];
+    const m = ffhqMatrix(kps, 512);
+    const eyeL = applyMatrix(m, kps[0]);
+    const eyeR = applyMatrix(m, kps[1]);
+    expect(eyeL[0]).toBeCloseTo(FFHQ_TEMPLATE[0][0] * 512, -1);
+    expect(eyeR[0]).toBeCloseTo(FFHQ_TEMPLATE[1][0] * 512, -1);
+    expect(Math.abs(eyeL[1] - eyeR[1])).toBeLessThan(3);
   });
 });

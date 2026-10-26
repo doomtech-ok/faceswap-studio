@@ -78,3 +78,19 @@ export function invertMatrix([a, b, c, d, e, f]) {
 export function applyMatrix([a, b, c, d, e, f], [x, y]) {
   return [a * x + c * y + e, b * x + d * y + f];
 }
+
+// FFHQ framing (normalized 0..1) that GFPGAN/CodeFormer were trained on, as
+// used by FaceFusion's "ffhq_512" template. Looser than ArcFace: more forehead
+// and chin, so the restorer sees the whole face.
+export const FFHQ_TEMPLATE = [
+  [0.37691676, 0.46864664],
+  [0.62285697, 0.46912813],
+  [0.50123859, 0.61331904],
+  [0.39308822, 0.725411],
+  [0.61150205, 0.72490465],
+];
+
+// Matrix that maps image keypoints into a `size` x `size` FFHQ-aligned crop.
+export function ffhqMatrix(kps, size) {
+  return estimateSimilarity(kps, FFHQ_TEMPLATE.map(([x, y]) => [x * size, y * size]));
+}
