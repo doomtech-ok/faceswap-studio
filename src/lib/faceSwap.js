@@ -350,12 +350,13 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
     sourceBitmap.close();
   }
 
-  // 2. Decodificar el video: <video> + canvas (más compatible que WebCodecs,
-  // que además necesitaría un demuxer para leer el archivo).
+  // 2. Decodificar el video: <video> + canvas (leer con WebCodecs necesitaría
+  // además un demuxer). La salida sí se codifica con WebCodecs (VideoEncoder).
   const videoEl = document.createElement('video');
   videoEl.muted = true;
   videoEl.preload = 'auto';
   videoEl.src = URL.createObjectURL(videoFile);
+  let encoder = null;
 
   try {
     await new Promise((resolve, reject) => {
@@ -368,12 +369,19 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
       throw new Error('El video no tiene una duración válida.');
     }
 
+    // Canvas de trabajo a 720p como máximo (1280x720, o 720x1280 en vertical):
+    // menos píxeles que dibujar, detectar y codificar.
+    const work = fitWithin(videoEl.videoWidth, videoEl.videoHeight, 1280, 720);
     const canvas = document.createElement('canvas');
-    canvas.width = videoEl.videoWidth;
-    canvas.height = videoEl.videoHeight;
+    canvas.width = work.width;
+    canvas.height = work.height;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    console.log(
+      `Resolución de trabajo: ${work.width}x${work.height} (original ${videoEl.videoWidth}x${videoEl.videoHeight})`
+    );
 
     const fps = 10; // procesamos 10 fps para no saturar la RX 580
+    const DETECT_EVERY = 5; // el detector corre en el frame 0 y luego cada 5
 
     // Canvas temporales: se crean una sola vez y se reutilizan en cada frame.
     const faceCanvas = document.createElement('canvas');
@@ -387,11 +395,14 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
     // Mueve el console.log de las entradas AQUÍ, antes del bucle
     console.log('Entradas que espera el modelo:', swapperSession.inputNames);
 
+    // 3. Codificador WebCodecs: cada frame se codifica en cuanto se termina.
+    encoder = await createEncoder(canvas.width, canvas.height, fps);
+
     const CHUNK_SIZE = 10; // fotogramas por bloque
-    const frameBlobs = [];
     // Procesar el video completo a `fps` cuadros por segundo, en bloques.
     const totalFrames = Math.max(1, Math.floor(duration * fps));
     const totalChunks = Math.ceil(totalFrames / CHUNK_SIZE);
+    let lastFace = null; // último rostro detectado (caja + 5 keypoints)
 
     for (let chunk = 0; chunk < totalChunks; chunk++) {
       const start = chunk * CHUNK_SIZE;
@@ -404,10 +415,17 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
 
         ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
 
-        // Detectar el rostro con SCRFD. Si no hay rostro, el frame queda igual.
-        const face = await detectFace(canvas, canvas.width, canvas.height);
-        if (face && face.kps.length === 5) {
-          if (i === 0) console.log('Rostro detectado en el frame 0:', face);
+        // Detectar con SCRFD solo cada DETECT_EVERY frames; en los intermedios
+        // se reutilizan la caja y los keypoints de la última detección.
+        if (shouldDetect(i, DETECT_EVERY)) {
+          const found = await detectFace(canvas, canvas.width, canvas.height);
+          lastFace = found && found.kps.length === 5 ? found : null;
+          if (i === 0 && lastFace) console.log('Rostro detectado en el frame 0:', lastFace);
+          if (!lastFace) console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
+        }
+        const face = lastFace;
+
+        if (face) {
           // Alinear el rostro a 128x128 con los 5 keypoints (plantilla ArcFace).
           const matrix = alignMatrix(face.kps, 128);
           warpAligned(faceCtx, canvas, matrix, 128);
@@ -429,18 +447,16 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
             );
           }
 
-          // Tomar la salida y devolverla al frame con la transformación inversa.
+          // Tomar la salida, ampliarla con enfoque y devolverla al frame.
           const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
           tensorToCanvas(output[outKey].data, 128, swapOutCanvas);
           pasteAligned(ctx, swapOutCanvas, matrix);
           // Liberar los tensores de este frame.
           targetTensor.dispose?.();
           for (const t of Object.values(output)) t.dispose?.();
-        } else {
-          console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
         }
 
-        frameBlobs.push(await canvasToBlob(canvas));
+        await encoder.addFrame(canvas, i);
 
         // Al final de cada iteración, cede el hilo
         await sleep(100);
@@ -455,33 +471,11 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
       await sleep(300);
     }
 
-    // 3. Codificar los frames a un nuevo video
-    const mimeType = pickRecorderMimeType();
-    const stream = canvas.captureStream(fps);
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-    const chunks = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) chunks.push(e.data);
-    };
-    const done = new Promise((r) => (recorder.onstop = r));
-
-    recorder.start();
-    // Decodificamos el siguiente JPEG mientras se muestra el actual, y soltamos
-    // cada uno en cuanto se dibuja.
-    let next = createImageBitmap(frameBlobs[0]);
-    for (let i = 0; i < frameBlobs.length; i++) {
-      const bitmap = await next;
-      frameBlobs[i] = null;
-      next = i + 1 < frameBlobs.length ? createImageBitmap(frameBlobs[i + 1]) : null;
-      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-      bitmap.close();
-      await sleep(1000 / fps);
-    }
-    recorder.stop();
-    await done;
-
-    return new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
+    const blob = await encoder.finish();
+    encoder = null;
+    return blob;
   } finally {
+    encoder?.close();
     URL.revokeObjectURL(videoEl.src);
   }
 }
