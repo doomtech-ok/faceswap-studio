@@ -19,4 +19,5 @@
 - SCRFD detector decoding lives in `src/lib/scrfd.js` as pure, DOM-free functions that classify outputs by shape, not name; why: lets it be tested in Node against the real model and survives exports with different output names.
 - Face alignment math (similarity transform to the ArcFace template) lives in `src/lib/faceAlign.js`, DOM-free with tests in `faceAlign.test.ts`; why: keeps the warp/inverse-warp verifiable outside the browser.
 - Face-swap output is encoded with WebCodecs `VideoEncoder` (H.264, falling back to VP9) and muxed into MP4 with `mp4-muxer`, one frame at a time inside the loop; why: faster than MediaRecorder and no per-frame storage.
-- DOM-free image/video helpers (working-resolution fit, detect-every-N, unsharp mask) live in `src/lib/imageOps.js` with tests in `imageOps.test.ts`; why: keeps them verifiable outside the browser.
+- DOM-free image/video helpers (working-resolution fit, detect-every-N, WASM thread count) live in `src/lib/imageOps.js` with tests in `imageOps.test.ts`; why: keeps them verifiable outside the browser.
+- Pages are served cross-origin isolated (COOP `same-origin` + COEP `credentialless`) via a dev-server middleware plugin in `vite.config.ts`, `src/server.ts`, and `public/_headers`; why: multi-threaded WASM needs SharedArrayBuffer, and the sandbox strips Vite `server.headers`.

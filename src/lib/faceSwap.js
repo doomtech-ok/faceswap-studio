@@ -7,15 +7,28 @@
 //   const { swapFaces } = await import("@/lib/faceSwap.js");
 //
 import * as ort from 'onnxruntime-web/webgpu';
-
-ort.env.wasm.simd = true;
-ort.env.wasm.numThreads = 1;
-
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { extractEmap, projectEmbedding } from './onnxEmap.js';
 import { DET_SIZE, rgbaToDetInput, decodeScrfd } from './scrfd.js';
 import { alignMatrix, invertMatrix } from './faceAlign.js';
-import { fitWithin, sharpenRGBA, shouldDetect } from './imageOps.js';
+import { fitWithin, pickWasmThreads, shouldDetect } from './imageOps.js';
+
+// WASM multihilo (el swapper corre en CPU). Solo funciona si la página está
+// aislada (crossOriginIsolated); si no, ORT usaría 1 hilo de todas formas.
+const isolated = typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated;
+ort.env.wasm.simd = true;
+ort.env.wasm.numThreads = pickWasmThreads(
+  typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 4,
+  isolated
+);
+if (isolated) {
+  console.log(`WASM con ${ort.env.wasm.numThreads} hilos`);
+} else {
+  console.warn(
+    'WASM con 1 hilo: la página no está aislada (crossOriginIsolated = false). ' +
+      'Abre la app en una pestaña propia para usar varios hilos.'
+  );
+}
 
 const SWAPPER_URL =
   'https://huggingface.co/datasets/JCTN/ReActor/resolve/main/models/inswapper_128.onnx';
@@ -135,46 +148,36 @@ function warpAligned(outCtx, source, matrix, size) {
 }
 
 // Pega `face` (alineado, 128x128) de vuelta en el frame con la transformación
-// inversa. Para que no quede borroso, primero se amplía al tamaño real que
-// tendrá en el frame (suavizado 'high') y se le aplica un filtro de enfoque
-// (unsharp mask); después se aplica la máscara de bordes suavizados.
-const SHARPEN_AMOUNT = 0.7;
-const MAX_UPSCALE = 512;
+// inversa. Primero se amplía a 256x256 sin suavizado (cada píxel se duplica
+// exacto, 2x) en un canvas intermedio, se le aplica la máscara de bordes
+// suavizados y luego ese canvas se dibuja en el frame.
+const PASTE_SIZE = 256;
 let pasteCanvas = null;
 function pasteAligned(ctx, face, matrix) {
   const size = face.width;
-  // matrix lleva imagen -> recorte; su escala dice cuántos px del frame ocupa
-  // cada px del recorte.
-  const s = Math.hypot(matrix[0], matrix[1]);
-  const up = Math.min(MAX_UPSCALE, Math.max(size, Math.ceil(size / s)));
-  if (!pasteCanvas) pasteCanvas = document.createElement('canvas');
-  if (pasteCanvas.width !== up || pasteCanvas.height !== up) {
-    pasteCanvas.width = up;
-    pasteCanvas.height = up;
+  if (!pasteCanvas) {
+    pasteCanvas = document.createElement('canvas');
+    pasteCanvas.width = PASTE_SIZE;
+    pasteCanvas.height = PASTE_SIZE;
   }
-  const t = pasteCanvas.getContext('2d', { willReadFrequently: true });
+  const t = pasteCanvas.getContext('2d');
   t.globalCompositeOperation = 'source-over';
-  t.clearRect(0, 0, up, up);
-  t.imageSmoothingEnabled = true;
-  t.imageSmoothingQuality = 'high';
-  t.drawImage(face, 0, 0, up, up);
+  t.clearRect(0, 0, PASTE_SIZE, PASTE_SIZE);
+  t.imageSmoothingEnabled = false;
+  t.drawImage(face, 0, 0, PASTE_SIZE, PASTE_SIZE);
 
-  const img = t.getImageData(0, 0, up, up);
-  sharpenRGBA(img.data, up, up, SHARPEN_AMOUNT);
-  t.putImageData(img, 0, 0);
-
-  const r = up / 2;
+  const r = PASTE_SIZE / 2;
   const grad = t.createRadialGradient(r, r, r * 0.65, r, r, r);
   grad.addColorStop(0, 'rgba(0,0,0,1)');
   grad.addColorStop(1, 'rgba(0,0,0,0)');
   t.globalCompositeOperation = 'destination-in';
   t.fillStyle = grad;
-  t.fillRect(0, 0, up, up);
+  t.fillRect(0, 0, PASTE_SIZE, PASTE_SIZE);
   t.globalCompositeOperation = 'source-over';
 
   ctx.save();
   ctx.setTransform(...invertMatrix(matrix));
-  ctx.scale(size / up, size / up);
+  ctx.scale(size / PASTE_SIZE, size / PASTE_SIZE);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(pasteCanvas, 0, 0);
@@ -253,6 +256,13 @@ function tensorToCanvas(outData, size, outCanvas) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Cede el hilo al navegador sin añadir retraso artificial. requestAnimationFrame
+// no se dispara con la pestaña oculta, así que ahí se usa setTimeout(0).
+const yieldToBrowser = () =>
+  typeof document !== 'undefined' && document.hidden
+    ? new Promise((r) => setTimeout(r, 0))
+    : new Promise((r) => requestAnimationFrame(r));
 
 // --- Codificación con WebCodecs ---
 
@@ -434,6 +444,7 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
           const targetTensor = canvasToTensor(faceCanvas, 128);
 
           let output;
+          console.time('swapFrame');
           try {
             output = await swapperSession.run({
               target: targetTensor,
@@ -445,6 +456,8 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
                 'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
                 `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
             );
+          } finally {
+            console.timeEnd('swapFrame');
           }
 
           // Tomar la salida, ampliarla con enfoque y devolverla al frame.
@@ -458,17 +471,16 @@ export async function swapFaces(faceImage, videoFile, onProgress) {
 
         await encoder.addFrame(canvas, i);
 
-        // Al final de cada iteración, cede el hilo
-        await sleep(100);
+        // Al final de cada iteración, cede el hilo (sin pausa artificial).
+        await yieldToBrowser();
 
         if (onProgress) onProgress((i + 1) / totalFrames);
       }
 
-      // Fin del bloque: limpiar los canvas temporales y dar un respiro mayor.
+      // Fin del bloque: limpiar los canvas temporales.
       faceCtx.clearRect(0, 0, 128, 128);
       swapOutCanvas.getContext('2d').clearRect(0, 0, 128, 128);
       console.log(`Bloque ${chunk + 1} procesado (${end}/${totalFrames} fotogramas)`);
-      await sleep(300);
     }
 
     const blob = await encoder.finish();

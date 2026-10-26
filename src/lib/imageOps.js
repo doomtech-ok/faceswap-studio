@@ -17,33 +17,11 @@ export function shouldDetect(frameIndex, every = 5) {
   return frameIndex % every === 0;
 }
 
-/**
- * Unsharp mask on RGBA pixels, in place: px + amount * (px - blur3x3(px)).
- * Only RGB is changed; alpha is kept. Edge pixels use clamped neighbours.
- * @param {Uint8ClampedArray} data RGBA pixels
- * @param {number} w
- * @param {number} h
- * @param {number} amount 0 = no change, ~0.5-1 = noticeable sharpening
- */
-export function sharpenRGBA(data, w, h, amount = 0.6) {
-  if (amount === 0) return data;
-  const src = new Uint8ClampedArray(data);
-  for (let y = 0; y < h; y++) {
-    const y0 = y > 0 ? y - 1 : 0;
-    const y2 = y < h - 1 ? y + 1 : h - 1;
-    for (let x = 0; x < w; x++) {
-      const x0 = x > 0 ? x - 1 : 0;
-      const x2 = x < w - 1 ? x + 1 : w - 1;
-      const i = (y * w + x) * 4;
-      for (let c = 0; c < 3; c++) {
-        const sum =
-          src[(y0 * w + x0) * 4 + c] + src[(y0 * w + x) * 4 + c] + src[(y0 * w + x2) * 4 + c] +
-          src[(y * w + x0) * 4 + c] + src[i + c] + src[(y * w + x2) * 4 + c] +
-          src[(y2 * w + x0) * 4 + c] + src[(y2 * w + x) * 4 + c] + src[(y2 * w + x2) * 4 + c];
-        const px = src[i + c];
-        data[i + c] = px + amount * (px - sum / 9);
-      }
-    }
-  }
-  return data;
+// Threads for the WASM backend. Multi-threaded WASM needs SharedArrayBuffer,
+// which browsers only allow on cross-origin isolated pages; otherwise 1.
+// Capped at 8 (e.g. a Ryzen 5 5600 reports 12 logical cores -> 8).
+export function pickWasmThreads(hardwareConcurrency, crossOriginIsolated, max = 8) {
+  if (!crossOriginIsolated) return 1;
+  const cores = Number.isFinite(hardwareConcurrency) && hardwareConcurrency > 0 ? hardwareConcurrency : 4;
+  return Math.max(1, Math.min(max, Math.floor(cores)));
 }
