@@ -68,8 +68,87 @@ export async function runModel(session, feeds) {
   return await session.run(feeds);
 }
 
-// Carga los tres modelos de forma secuencial (WebGPU solo permite crear una
-// sesión a la vez) y bloquea cargas concurrentes.
+// --- Carga de modelos con progreso ---
+//
+// Los cuatro modelos se descargan y se inicializan en orden (WebGPU solo
+// permite crear una sesión a la vez). El progreso total se reparte según el
+// tamaño de cada archivo: la descarga cuenta el 90 % de cada modelo y la
+// creación de la sesión el 10 % restante.
+const MODELS = [
+  { key: 'detector', label: 'Face detector', bytes: 16_923_827 },
+  { key: 'swapper', label: 'Face swapper', bytes: 554_253_681 },
+  { key: 'recognizer', label: 'Face recognizer', bytes: 174_383_860 },
+  { key: 'restorer', label: 'GFPGAN', bytes: 340_299_087 },
+];
+const TOTAL_MODEL_BYTES = MODELS.reduce((s, m) => s + m.bytes, 0);
+
+let loadState = { fraction: 0, label: 'Starting…' };
+const loadListeners = new Set();
+
+function emitLoad(key, modelFraction, label) {
+  let done = 0;
+  for (const m of MODELS) {
+    if (m.key === key) {
+      done += m.bytes * Math.min(1, Math.max(0, modelFraction));
+      break;
+    }
+    done += m.bytes;
+  }
+  loadState = { fraction: Math.min(1, done / TOTAL_MODEL_BYTES), label };
+  for (const fn of loadListeners) fn(loadState);
+}
+
+// Descarga un modelo leyendo el stream para poder informar el progreso.
+async function fetchModelBytes(url, onFraction) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Could not download a model (${res.status}).`);
+  const total = Number(res.headers.get('content-length')) || 0;
+  if (!res.body) {
+    const buf = new Uint8Array(await res.arrayBuffer());
+    onFraction(1);
+    return buf;
+  }
+  const reader = res.body.getReader();
+  // Con tamaño conocido escribimos directo en un único buffer (sin copias extra).
+  let out = total ? new Uint8Array(total) : null;
+  const parts = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (out && received + value.length <= out.length) out.set(value, received);
+    else {
+      if (out) {
+        parts.push(out.subarray(0, received));
+        out = null;
+      }
+      parts.push(value);
+    }
+    received += value.length;
+    if (total) onFraction(received / total);
+  }
+  if (!out) {
+    out = new Uint8Array(received);
+    let off = 0;
+    for (const p of parts) {
+      out.set(p, off);
+      off += p.length;
+    }
+  } else if (received < out.length) {
+    out = out.subarray(0, received);
+  }
+  onFraction(1);
+  return out;
+}
+
+async function loadTracked(key, label, url) {
+  emitLoad(key, 0, `Downloading ${label}…`);
+  const bytes = await fetchModelBytes(url, (f) => emitLoad(key, f * 0.9, `Downloading ${label}…`));
+  emitLoad(key, 0.9, `Initializing ${label}…`);
+  return bytes;
+}
+
+// Carga secuencial y bloquea cargas concurrentes.
 let isLoading = false;
 let loadingPromise = null;
 
@@ -90,16 +169,16 @@ async function ensureModels({ highQuality = false } = {}) {
     try {
       if (!detectorSession) {
         console.log('Cargando detector facial (SCRFD)...');
-        detectorSession = await loadModel(DETECTOR_URL);
+        const bytes = await loadTracked('detector', 'face detector', DETECTOR_URL);
+        detectorSession = await loadModel(bytes);
         console.log('✅ Detector listo');
       }
+      emitLoad('detector', 1, 'Face detector ready');
       if (!swapperSession) {
         console.log('Descargando swapper (puede tardar por el tamaño)...');
         // Descargamos los bytes nosotros mismos para leer la matriz emap del
         // archivo (ORT Web no expone los initializers de la sesión).
-        const res = await fetch(SWAPPER_URL);
-        if (!res.ok) throw new Error(`No se pudo descargar el swapper (${res.status}).`);
-        let bytes = new Uint8Array(await res.arrayBuffer());
+        let bytes = await loadTracked('swapper', 'face swapper', SWAPPER_URL);
         emap = extractEmap(bytes);
         console.log('✅ Matriz emap extraída [512,512]');
         // Precisión completa y solo WASM: la RX 580 no soporta shader-f16 en WebGPU.
@@ -107,12 +186,18 @@ async function ensureModels({ highQuality = false } = {}) {
         bytes = null; // liberar memoria
         console.log('✅ Swapper listo');
       }
+      emitLoad('swapper', 1, 'Face swapper ready');
       if (!recognizerSession) {
         console.log('Cargando reconocedor facial...');
-        recognizerSession = await loadModel(RECOGNIZER_URL);
+        const bytes = await loadTracked('recognizer', 'face recognizer', RECOGNIZER_URL);
+        recognizerSession = await loadModel(bytes);
         console.log('✅ Reconocedor listo');
       }
-      if (highQuality && !restorerSession) await loadRestorer();
+      emitLoad('recognizer', 1, 'Face recognizer ready');
+      if (highQuality) {
+        if (!restorerSession) await loadRestorer();
+        emitLoad('restorer', 1, 'All models ready');
+      }
       return { detectorSession, swapperSession, recognizerSession, restorerSession };
     } finally {
       isLoading = false;
@@ -122,13 +207,37 @@ async function ensureModels({ highQuality = false } = {}) {
   return loadingPromise;
 }
 
+/**
+ * Descarga e inicializa los cuatro modelos (detector, swapper, reconocedor y
+ * GFPGAN). Llamar al abrir la página. Llamadas repetidas comparten la misma
+ * carga; si algo falla, volver a llamar carga solo lo que falte.
+ * @param {(state: { fraction: number, label: string }) => void} [onProgress]
+ */
+export async function preloadModels(onProgress) {
+  if (onProgress) {
+    loadListeners.add(onProgress);
+    onProgress(loadState);
+  }
+  try {
+    await ensureModels({ highQuality: true });
+  } finally {
+    if (onProgress) loadListeners.delete(onProgress);
+  }
+}
+
+export function areModelsReady() {
+  return Boolean(detectorSession && swapperSession && recognizerSession && restorerSession);
+}
+
 // GFPGAN se intenta en WebGPU (es pesado para CPU) y, si falla al crear la
 // sesión, se carga en WASM. Solo se llama dentro de ensureModels (una a la vez).
 async function loadRestorer(forceWasm = false) {
   console.log('Descargando GFPGAN 1.4 (~340 MB, solo la primera vez)...');
+  // Primera carga: con progreso. El reintento en WASM vuelve a pedir la URL.
+  const source = forceWasm ? RESTORER_URL : await loadTracked('restorer', 'GFPGAN', RESTORER_URL);
   if (!forceWasm && isWebGpuAvailable()) {
     try {
-      restorerSession = await loadModel(RESTORER_URL, ['webgpu']);
+      restorerSession = await loadModel(source, ['webgpu']);
       restorerBackend = 'webgpu';
       console.log('✅ GFPGAN listo (WebGPU)');
       return;
@@ -136,7 +245,7 @@ async function loadRestorer(forceWasm = false) {
       console.warn('GFPGAN no pudo cargarse en WebGPU, se usa WASM:', e);
     }
   }
-  restorerSession = await loadModel(RESTORER_URL, ['wasm']);
+  restorerSession = await loadModel(source, ['wasm']);
   restorerBackend = 'wasm';
   console.log('✅ GFPGAN listo (WASM)');
 }
