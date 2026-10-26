@@ -11,7 +11,7 @@ import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { extractEmap, projectEmbedding } from './onnxEmap.js';
 import { DET_SIZE, rgbaToDetInput, decodeScrfd } from './scrfd.js';
 import { alignMatrix, invertMatrix } from './faceAlign.js';
-import { fitWithin, pickWasmThreads, shouldDetect } from './imageOps.js';
+import { fitWithin, shouldDetect } from './imageOps.js';
 
 // WASM multihilo (el swapper corre en CPU). Solo funciona si la página está
 // aislada (crossOriginIsolated); si no, ORT usaría 1 hilo de todas formas.
