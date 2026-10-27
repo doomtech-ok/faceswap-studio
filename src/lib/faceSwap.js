@@ -11,7 +11,7 @@ import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { extractEmap, projectEmbedding } from './onnxEmap.js';
 import { DET_SIZE, rgbaToDetInput, decodeScrfd } from './scrfd.js';
 import { alignMatrix, ffhqMatrix, invertMatrix } from './faceAlign.js';
-import { fitWithin, shouldDetect } from './imageOps.js';
+import { fitWithin, canReuseSwap } from './imageOps.js';
 
 // WASM multihilo (el swapper corre en CPU). Solo funciona si la página está
 // aislada (crossOriginIsolated); si no, ORT usaría 1 hilo de todas formas.
@@ -417,16 +417,24 @@ async function restoreFace(ctx, frameCanvas, kps) {
   outCtx.drawImage(mask, 0, 0);
   outCtx.globalCompositeOperation = 'source-over';
 
+  pasteRestored(ctx, matrix);
+
+  tensor.dispose?.();
+  for (const t of Object.values(output)) t.dispose?.();
+  return matrix;
+}
+
+// Pega el último rostro restaurado (guardado en restoreOutCanvas) con la
+// transformación inversa. Se usa también para reutilizarlo en frames quietos.
+function pasteRestored(ctx, matrix) {
+  if (!restoreOutCanvas) return;
   ctx.save();
   ctx.setTransform(...invertMatrix(matrix));
   ctx.globalAlpha = RESTORE_BLEND;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(outCanvas, 0, 0);
+  ctx.drawImage(restoreOutCanvas, 0, 0);
   ctx.restore();
-
-  tensor.dispose?.();
-  for (const t of Object.values(output)) t.dispose?.();
 }
 
 // Extrae el embedding facial [1,512] con el reconocedor (ArcFace w600k_r50)
