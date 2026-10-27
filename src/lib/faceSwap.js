@@ -648,13 +648,16 @@ export async function swapFaces(faceImage, videoFile, onProgress, options = {}) 
     );
 
     const fps = 10; // procesamos 10 fps para no saturar la RX 580
-    const DETECT_EVERY = 5; // el detector corre en el frame 0 y luego cada 5
+    // Motion check: el detector corre en cada frame (es ligero). Si la caja se
+    // movió menos de este umbral desde el último swap, se reutiliza ese swap.
+    const MOTION_THRESHOLD = 0.05;
 
     // Canvas temporales: se crean una sola vez y se reutilizan en cada frame.
     const faceCanvas = document.createElement('canvas');
     faceCanvas.width = 128;
     faceCanvas.height = 128;
     const faceCtx = faceCanvas.getContext('2d', { willReadFrequently: true });
+    // Guarda el último rostro intercambiado (128x128) para reutilizarlo.
     const swapOutCanvas = document.createElement('canvas');
     swapOutCanvas.width = 128;
     swapOutCanvas.height = 128;
@@ -669,7 +672,11 @@ export async function swapFaces(faceImage, videoFile, onProgress, options = {}) 
     // Procesar el video completo a `fps` cuadros por segundo, en bloques.
     const totalFrames = Math.max(1, Math.floor(duration * fps));
     const totalChunks = Math.ceil(totalFrames / CHUNK_SIZE);
-    let lastFace = null; // último rostro detectado (caja + 5 keypoints)
+    // Último swap real: caja/keypoints del rostro, su matriz de alineación y,
+    // en alta calidad, la matriz FFHQ del rostro restaurado. null = no hay swap
+    // reutilizable (inicio o se perdió la cara).
+    let lastSwap = null;
+    const stats = { swapped: 0, reused: 0, noFace: 0 };
 
     for (let chunk = 0; chunk < totalChunks; chunk++) {
       const start = chunk * CHUNK_SIZE;
@@ -682,17 +689,24 @@ export async function swapFaces(faceImage, videoFile, onProgress, options = {}) 
 
         ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
 
-        // Detectar con SCRFD solo cada DETECT_EVERY frames; en los intermedios
-        // se reutilizan la caja y los keypoints de la última detección.
-        if (shouldDetect(i, DETECT_EVERY)) {
-          const found = await detectFace(canvas, canvas.width, canvas.height);
-          lastFace = found && found.kps.length === 5 ? found : null;
-          if (i === 0 && lastFace) console.log('Rostro detectado en el frame 0:', lastFace);
-          if (!lastFace) console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
-        }
-        const face = lastFace;
+        // Detectar con SCRFD en cada frame.
+        const found = await detectFace(canvas, canvas.width, canvas.height);
+        const face = found && found.kps.length === 5 ? found : null;
+        if (i === 0 && face) console.log('Rostro detectado en el frame 0:', face);
 
-        if (face) {
+        if (!face) {
+          // Cara perdida: el frame queda original (sin congelar la última cara)
+          // y el siguiente frame con cara vuelve a correr el swapper.
+          lastSwap = null;
+          stats.noFace++;
+          console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
+        } else if (canReuseSwap(lastSwap?.face, face, MOTION_THRESHOLD)) {
+          // Movimiento < 5 %: pegar el mismo rostro del último swap con sus
+          // keypoints, sin correr el swapper (ni GFPGAN). Sin mezcla de frames.
+          pasteAligned(ctx, swapOutCanvas, lastSwap.matrix);
+          if (highQuality && lastSwap.restoreMatrix) pasteRestored(ctx, lastSwap.restoreMatrix);
+          stats.reused++;
+        } else {
           // Alinear el rostro a 128x128 con los 5 keypoints (plantilla ArcFace).
           const matrix = alignMatrix(face.kps, 128);
           warpAligned(faceCtx, canvas, matrix, 128);
@@ -717,15 +731,18 @@ export async function swapFaces(faceImage, videoFile, onProgress, options = {}) 
             console.timeEnd('swapFrame');
           }
 
-          // Tomar la salida, ampliarla con enfoque y devolverla al frame.
+          // Tomar la salida y devolverla al frame (solo la cara nueva, sin mezcla).
           const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
           tensorToCanvas(output[outKey].data, 128, swapOutCanvas);
           pasteAligned(ctx, swapOutCanvas, matrix);
           // Alta calidad: restaurar el rostro intercambiado con GFPGAN a 512x512.
-          if (highQuality) await restoreFace(ctx, canvas, face.kps);
+          const restoreMatrix = highQuality ? await restoreFace(ctx, canvas, face.kps) : null;
           // Liberar los tensores de este frame.
           targetTensor.dispose?.();
           for (const t of Object.values(output)) t.dispose?.();
+
+          lastSwap = { face, matrix, restoreMatrix };
+          stats.swapped++;
         }
 
         await encoder.addFrame(canvas, i);
@@ -736,11 +753,16 @@ export async function swapFaces(faceImage, videoFile, onProgress, options = {}) 
         if (onProgress) onProgress((i + 1) / totalFrames);
       }
 
-      // Fin del bloque: limpiar los canvas temporales.
+      // Fin del bloque: limpiar el canvas de entrada (swapOutCanvas se conserva
+      // porque guarda el último swap reutilizable).
       faceCtx.clearRect(0, 0, 128, 128);
-      swapOutCanvas.getContext('2d').clearRect(0, 0, 128, 128);
       console.log(`Bloque ${chunk + 1} procesado (${end}/${totalFrames} fotogramas)`);
     }
+
+    console.log(
+      `Swapper ejecutado en ${stats.swapped} frames, reutilizado en ${stats.reused}, ` +
+        `sin rostro en ${stats.noFace} (de ${totalFrames}).`
+    );
 
     const blob = await encoder.finish();
     encoder = null;
