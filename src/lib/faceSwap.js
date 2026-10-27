@@ -648,9 +648,10 @@ export async function swapFaces(faceImage, videoFile, onProgress, options = {}) 
     );
 
     const fps = 10; // procesamos 10 fps para no saturar la RX 580
-    // Motion check: el detector corre en cada frame (es ligero). Si la caja se
-    // movió menos de este umbral desde el último swap, se reutiliza ese swap.
-    const MOTION_THRESHOLD = 0.05;
+    // Seguimiento: el detector corre en cada frame y su caja/keypoints SIEMPRE
+    // se usan para pegar la cara. Solo los píxeles del swap se reutilizan si la
+    // caja se movió < 2 % respecto al frame anterior y no se reutilizaron ya
+    // 4 veces seguidas (ver canReuseSwap en imageOps.js).
 
     // Canvas temporales: se crean una sola vez y se reutilizan en cada frame.
     const faceCanvas = document.createElement('canvas');
@@ -672,10 +673,12 @@ export async function swapFaces(faceImage, videoFile, onProgress, options = {}) 
     // Procesar el video completo a `fps` cuadros por segundo, en bloques.
     const totalFrames = Math.max(1, Math.floor(duration * fps));
     const totalChunks = Math.ceil(totalFrames / CHUNK_SIZE);
-    // Último swap real: caja/keypoints del rostro, su matriz de alineación y,
-    // en alta calidad, la matriz FFHQ del rostro restaurado. null = no hay swap
-    // reutilizable (inicio o se perdió la cara).
-    let lastSwap = null;
+    // Rostro detectado en el frame ANTERIOR (null = no había cara o es el
+    // inicio). Si no es null, swapOutCanvas (y restoreOutCanvas en alta
+    // calidad) guardan un swap válido para reutilizar.
+    let prevFace = null;
+    let reuseCount = 0; // reutilizaciones seguidas del mismo swap
+    let lastSwapRestored = false; // el swap guardado pasó por GFPGAN
     const stats = { swapped: 0, reused: 0, noFace: 0 };
 
     for (let chunk = 0; chunk < totalChunks; chunk++) {
@@ -697,52 +700,60 @@ export async function swapFaces(faceImage, videoFile, onProgress, options = {}) 
         if (!face) {
           // Cara perdida: el frame queda original (sin congelar la última cara)
           // y el siguiente frame con cara vuelve a correr el swapper.
-          lastSwap = null;
+          prevFace = null;
+          reuseCount = 0;
           stats.noFace++;
           console.warn(`Frame ${i}: no se detectó ningún rostro, se deja sin cambios.`);
-        } else if (canReuseSwap(lastSwap?.face, face, MOTION_THRESHOLD)) {
-          // Movimiento < 5 %: pegar el mismo rostro del último swap con sus
-          // keypoints, sin correr el swapper (ni GFPGAN). Sin mezcla de frames.
-          pasteAligned(ctx, swapOutCanvas, lastSwap.matrix);
-          if (highQuality && lastSwap.restoreMatrix) pasteRestored(ctx, lastSwap.restoreMatrix);
-          stats.reused++;
         } else {
-          // Alinear el rostro a 128x128 con los 5 keypoints (plantilla ArcFace).
+          // Matriz de ESTE frame: la cara siempre se pega en la posición real.
           const matrix = alignMatrix(face.kps, 128);
-          warpAligned(faceCtx, canvas, matrix, 128);
 
-          // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
-          const targetTensor = canvasToTensor(faceCanvas, 128);
+          if (canReuseSwap(prevFace, face, reuseCount)) {
+            // Movimiento < 2 % desde el frame anterior y < 4 reusos: reutilizar
+            // los píxeles del último swap, colocados con los keypoints actuales.
+            pasteAligned(ctx, swapOutCanvas, matrix);
+            if (lastSwapRestored) pasteRestored(ctx, ffhqMatrix(face.kps, RESTORE_SIZE));
+            reuseCount++;
+            stats.reused++;
+          } else {
+            // Alinear el rostro a 128x128 con los 5 keypoints (plantilla ArcFace).
+            warpAligned(faceCtx, canvas, matrix, 128);
 
-          let output;
-          console.time('swapFrame');
-          try {
-            output = await swapperSession.run({
-              target: targetTensor,
-              source: sourceEmbedding, // [1, 512]
-            });
-          } catch (e) {
-            throw new Error(
-              'El swapper rechazó las entradas. inswapper_128 espera "source" como un ' +
-                'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
-                `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
-            );
-          } finally {
-            console.timeEnd('swapFrame');
+            // Ejecutar el swapper: inswapper_128 usa "target" [1,3,128,128] y "source".
+            const targetTensor = canvasToTensor(faceCanvas, 128);
+
+            let output;
+            console.time('swapFrame');
+            try {
+              output = await swapperSession.run({
+                target: targetTensor,
+                source: sourceEmbedding, // [1, 512]
+              });
+            } catch (e) {
+              throw new Error(
+                'El swapper rechazó las entradas. inswapper_128 espera "source" como un ' +
+                  'embedding facial [1,512] (de un modelo de reconocimiento como ArcFace), ' +
+                  `no una imagen. Detalle: ${e instanceof Error ? e.message : String(e)}`
+              );
+            } finally {
+              console.timeEnd('swapFrame');
+            }
+
+            // Tomar la salida y devolverla al frame (solo la cara nueva, sin mezcla).
+            const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
+            tensorToCanvas(output[outKey].data, 128, swapOutCanvas);
+            pasteAligned(ctx, swapOutCanvas, matrix);
+            // Alta calidad: restaurar el rostro intercambiado con GFPGAN a 512x512.
+            if (highQuality) await restoreFace(ctx, canvas, face.kps);
+            lastSwapRestored = highQuality;
+            // Liberar los tensores de este frame.
+            targetTensor.dispose?.();
+            for (const t of Object.values(output)) t.dispose?.();
+
+            reuseCount = 0;
+            stats.swapped++;
           }
-
-          // Tomar la salida y devolverla al frame (solo la cara nueva, sin mezcla).
-          const outKey = swapperSession.outputNames[0] ?? Object.keys(output)[0];
-          tensorToCanvas(output[outKey].data, 128, swapOutCanvas);
-          pasteAligned(ctx, swapOutCanvas, matrix);
-          // Alta calidad: restaurar el rostro intercambiado con GFPGAN a 512x512.
-          const restoreMatrix = highQuality ? await restoreFace(ctx, canvas, face.kps) : null;
-          // Liberar los tensores de este frame.
-          targetTensor.dispose?.();
-          for (const t of Object.values(output)) t.dispose?.();
-
-          lastSwap = { face, matrix, restoreMatrix };
-          stats.swapped++;
+          prevFace = face;
         }
 
         await encoder.addFrame(canvas, i);

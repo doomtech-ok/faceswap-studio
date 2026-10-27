@@ -19,19 +19,23 @@ describe('fitWithin (720p working canvas)', () => {
   });
 });
 
-describe('motion check (reuse swap when the box moved less than 5 %)', () => {
+describe('motion check (reuse swap when the box moved less than 2 % since the previous frame)', () => {
   const box = { x: 100, y: 100, width: 200, height: 200 };
   it('measures a 10 px shift on a 200 px box as 5 %', () => {
     expect(boxMotion(box, { ...box, x: 110 })).toBeCloseTo(0.05);
   });
-  it('reuses the previous swap when the box moved 4 %', () => {
-    expect(canReuseSwap(box, { ...box, x: 108 })).toBe(true);
+  it('reuses the previous swap when the box moved 1.5 %', () => {
+    expect(canReuseSwap(box, { ...box, x: 103 })).toBe(true);
   });
-  it('runs the swapper again when the box moved exactly 5 %', () => {
-    expect(canReuseSwap(box, { ...box, x: 110 })).toBe(false);
+  it('runs the swapper again when the box moved exactly 2 %', () => {
+    expect(canReuseSwap(box, { ...box, x: 104 })).toBe(false);
   });
-  it('runs the swapper again when the face grew 10 %', () => {
-    expect(canReuseSwap(box, { ...box, width: 220, height: 220 })).toBe(false);
+  it('runs the swapper again when the box moved 4 % (old 5 % rule would reuse)', () => {
+    expect(canReuseSwap(box, { ...box, x: 108 })).toBe(false);
+  });
+  it('allows up to 4 reuses in a row, then forces the swapper', () => {
+    expect(canReuseSwap(box, box, 3)).toBe(true);
+    expect(canReuseSwap(box, box, 4)).toBe(false);
   });
   it('never reuses when there is no previous face or no current face', () => {
     expect(canReuseSwap(null, box)).toBe(false);

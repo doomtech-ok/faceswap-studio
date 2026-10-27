@@ -24,11 +24,17 @@ export function boxMotion(prev, cur) {
   return Math.max(dcx, dcy, dw, dh);
 }
 
-// True when the swapped face from `prev` can be reused for `cur` (both faces
-// detected and the box moved less than `threshold`). Otherwise the swapper
-// must run again.
-export function canReuseSwap(prev, cur, threshold = 0.05) {
+// Reuse rule for the swapped face pixels:
+// - `prev` is the face detected in the PREVIOUS frame (not the last swapped one).
+// - reuse only if the box moved less than MOTION_THRESHOLD (2 %) since then,
+// - and the same swap output was reused fewer than MAX_REUSE (4) times in a row.
+// The reused pixels are always pasted at the CURRENT frame's keypoints.
+export const MOTION_THRESHOLD = 0.02;
+export const MAX_REUSE = 4;
+
+export function canReuseSwap(prev, cur, reuseCount = 0, threshold = MOTION_THRESHOLD, maxReuse = MAX_REUSE) {
   if (!prev || !cur) return false;
+  if (reuseCount >= maxReuse) return false;
   return boxMotion(prev, cur) < threshold;
 }
 
