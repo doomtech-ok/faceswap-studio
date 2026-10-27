@@ -1,6 +1,6 @@
 // @ts-nocheck -- JS module under test has loose JSDoc types
 import { describe, expect, it } from 'vitest';
-import { fitWithin, pickWasmThreads, shouldDetect } from './imageOps.js';
+import { boxMotion, canReuseSwap, fitWithin, pickWasmThreads } from './imageOps.js';
 
 describe('fitWithin (720p working canvas)', () => {
   it('shrinks 1080p landscape to 1280x720', () => {
@@ -19,10 +19,23 @@ describe('fitWithin (720p working canvas)', () => {
   });
 });
 
-describe('shouldDetect (detector every 5 frames)', () => {
-  it('runs on frames 0, 5, 10 and skips the ones in between', () => {
-    const detected = Array.from({ length: 11 }, (_, i) => i).filter((i) => shouldDetect(i, 5));
-    expect(detected).toEqual([0, 5, 10]);
+describe('motion check (reuse swap when the box moved less than 5 %)', () => {
+  const box = { x: 100, y: 100, width: 200, height: 200 };
+  it('measures a 10 px shift on a 200 px box as 5 %', () => {
+    expect(boxMotion(box, { ...box, x: 110 })).toBeCloseTo(0.05);
+  });
+  it('reuses the previous swap when the box moved 4 %', () => {
+    expect(canReuseSwap(box, { ...box, x: 108 })).toBe(true);
+  });
+  it('runs the swapper again when the box moved exactly 5 %', () => {
+    expect(canReuseSwap(box, { ...box, x: 110 })).toBe(false);
+  });
+  it('runs the swapper again when the face grew 10 %', () => {
+    expect(canReuseSwap(box, { ...box, width: 220, height: 220 })).toBe(false);
+  });
+  it('never reuses when there is no previous face or no current face', () => {
+    expect(canReuseSwap(null, box)).toBe(false);
+    expect(canReuseSwap(box, null)).toBe(false);
   });
 });
 

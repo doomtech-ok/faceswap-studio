@@ -11,10 +11,25 @@ export function fitWithin(width, height, maxLong = 1280, maxShort = 720) {
   return { width: even(width), height: even(height) };
 }
 
-// True on frame 0 and then every `every` frames; in between, the last
-// detected face box + keypoints are reused.
-export function shouldDetect(frameIndex, every = 5) {
-  return frameIndex % every === 0;
+// How much a face box moved between two detections, relative to the size of
+// `prev`: the largest of the center shift (x, y) and the size change (w, h),
+// each divided by the previous width/height. 0.05 = 5 %.
+export function boxMotion(prev, cur) {
+  const pw = Math.max(prev.width, 1e-6);
+  const ph = Math.max(prev.height, 1e-6);
+  const dcx = Math.abs(cur.x + cur.width / 2 - (prev.x + prev.width / 2)) / pw;
+  const dcy = Math.abs(cur.y + cur.height / 2 - (prev.y + prev.height / 2)) / ph;
+  const dw = Math.abs(cur.width - prev.width) / pw;
+  const dh = Math.abs(cur.height - prev.height) / ph;
+  return Math.max(dcx, dcy, dw, dh);
+}
+
+// True when the swapped face from `prev` can be reused for `cur` (both faces
+// detected and the box moved less than `threshold`). Otherwise the swapper
+// must run again.
+export function canReuseSwap(prev, cur, threshold = 0.05) {
+  if (!prev || !cur) return false;
+  return boxMotion(prev, cur) < threshold;
 }
 
 // Threads for the WASM backend. Multi-threaded WASM needs SharedArrayBuffer,
